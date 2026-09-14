@@ -255,8 +255,8 @@ class Go2Base(MuJoCoWarp):
         mdp_info.action_space = Box(action_low, action_high)
 
         mdp_info = super()._modify_mdp_info(mdp_info)
-        self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.LS_ITERATIONS
-        self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.ITERATIONS
+        # self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.LS_ITERATIONS
+        # self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.ITERATIONS
         mdp_info.observation_space = Box(*self.obs_helper.get_obs_limits())
         return mdp_info
 

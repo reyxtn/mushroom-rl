@@ -1,8 +1,6 @@
 """
 This script shows how to train the Unitree Go2 velocity tracking task with PPO in MuJoCo Warp.
 
-The environment and reward follow the IsaacSim A1 example and Rudin et al., "Learning to Walk
-in Minutes Using Massively Parallel Deep Reinforcement Learning".
 
 """
 

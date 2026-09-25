@@ -92,6 +92,21 @@ def test_peg_insertion():
     assert np.allclose(obs, obs_test)
 
 
+def test_peg_insertion_additional_data():
+    np.random.seed(42)
+    random.seed(42)
+    torch.manual_seed(42)
+
+    mdp = PegInsertion()
+    mdp.reset()
+
+    sizes = {key: len(mdp._read_data(key)) for key in mdp.additional_data}
+
+    assert sizes == {'peg_pos': 3, 'peg_rot': 4, 'goal_pos': 3, 'goal_rot': 4, 'joint1_pos': 1, 'joint2_pos': 1,
+                     'joint3_pos': 1, 'joint4_pos': 1, 'joint5_pos': 1, 'joint6_pos': 1, 'joint7_pos': 1,
+                     'finger_joint1_pos': 1, 'finger_joint2_pos': 1, 'gripper_pos': 3, 'gripper_rot': 9}
+
+
 def test_push_reward():
     np.random.seed(42)
     random.seed(42)
@@ -165,11 +180,11 @@ def test_pick_reward():
     assert dual_contact_steps == 41
     assert np.sum(np.any(robot_forces != 0, axis=1)) == 51
     assert np.sum(np.any(gripper_forces != 0, axis=1)) == 65
-    assert np.allclose(np.abs(robot_forces).max(), 275.6708831217831)
-    assert np.allclose(np.abs(gripper_forces).max(), 144.3765759728655)
-    assert np.allclose(np.sum(rewards), 0.8314536740093227)
+    assert np.allclose(np.abs(robot_forces).max(), 275.6706714331601)
+    assert np.allclose(np.abs(gripper_forces).max(), 144.35769423737185)
+    assert np.allclose(np.sum(rewards), 0.8314528651984001)
     assert np.allclose(np.min(contact_costs), -0.0006)
-    assert np.allclose(np.sum(contact_costs), -0.03443466423206673)
+    assert np.allclose(np.sum(contact_costs), -0.03443473778441179)
 
 
 def test_peg_insertion_reward():
@@ -200,12 +215,12 @@ def test_peg_insertion_reward():
 
     assert robot_forces.shape == (100, 3)
     assert gripper_forces.shape == (100, 3)
-    assert dual_contact_steps == 24
+    assert dual_contact_steps == 22
     assert np.sum(np.any(robot_forces != 0, axis=1)) == 47
-    assert np.sum(np.any(gripper_forces != 0, axis=1)) == 32
-    assert np.allclose(np.abs(robot_forces).max(), 313.05940065768687)
-    assert np.allclose(np.abs(gripper_forces).max(), 117.51297188478829)
-    assert np.allclose(np.sum(rewards), 4.1130012022173625)
+    assert np.sum(np.any(gripper_forces != 0, axis=1)) == 33
+    assert np.allclose(np.abs(robot_forces).max(), 612.5917962548951)
+    assert np.allclose(np.abs(gripper_forces).max(), 186.04840014236282)
+    assert np.allclose(np.sum(rewards), 4.159753405350865)
 
 
 def test_peg_insertion_alignment():

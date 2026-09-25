@@ -763,7 +763,7 @@ class HistoryManager(MushroomObject):
         self._last_action = None
 
     def _zero_buffers_vectorized(self, mask):
-        mask = self._agent_backend.convert(mask, device=self._device)
+        mask = self._agent_backend.convert_mask(mask, device=self._device)
         for buffer in self._buffers.values():
             buffer[mask] = 0
         if self._last_action is not None:
@@ -820,6 +820,8 @@ class HistoryManager(MushroomObject):
             buffer[:] = stacked[:, 1:]
         else:
             stacked = self._agent_backend.concatenate([buffer, value[None]], dim=0)
+            if isinstance(stacked, list):
+                stacked = self._agent_backend.copy(stacked)
             buffer[:] = stacked[1:]
 
         return stacked

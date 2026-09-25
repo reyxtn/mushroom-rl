@@ -251,6 +251,28 @@ def test_from_array_list_backend_ragged():
     assert np.array_equal(dataset.compute_J(), np.array([3.0]))
 
 
+def test_list_dataset_parse_to_torch():
+    states = np.arange(12).reshape(6, 2).astype(float)
+    actions = np.zeros((6, 1))
+    rewards = np.ones(6)
+    next_states = states + 1
+    absorbings = np.zeros(6)
+    lasts = np.array([0, 0, 1, 0, 0, 1])
+
+    list_dataset = Dataset.from_array(states, actions, rewards, next_states, absorbings, lasts,
+                                      backend='list', gamma=0.9)
+    numpy_dataset = Dataset.from_array(states, actions, rewards, next_states, absorbings, lasts,
+                                       gamma=0.9)
+
+    for from_list, from_numpy in zip(list_dataset.parse(to='torch'), numpy_dataset.parse(to='torch')):
+        assert from_list.dtype == from_numpy.dtype
+        assert torch.equal(from_list, from_numpy)
+
+    for from_list, from_numpy in zip(list_dataset.parse(to='numpy'), numpy_dataset.parse(to='numpy')):
+        assert from_list.dtype == from_numpy.dtype
+        assert np.array_equal(from_list, from_numpy)
+
+
 def test_dataset_policy_backend_split():
     n = 4
     states = np.arange(n * 2).reshape(n, 2).astype(float)
@@ -311,22 +333,16 @@ def build_info_dataset(n, first_reward, capacity):
     lasts = np.zeros(n, dtype=bool)
     lasts[-1] = True
 
-    info = ExtraInfo(1, 'numpy')
+    extras = ExtraInfo(1, 'numpy')
     for i in range(n):
-        info.append({'idx': float(i + first_reward)})
-    episode_info = ExtraInfo(1, 'numpy')
-    episode_info.append({'ep': float(first_reward)})
-    theta_list = [np.array([float(first_reward)])]
+        extras.append_step({'idx': float(i + first_reward)})
+    extras.append_episode({'ep': float(first_reward)})
+    extras.append_theta(np.array([float(first_reward)]))
 
     dataset = Dataset.from_array(states, actions, rewards, next_states, absorbings, lasts,
-                                 info=info, episode_info=episode_info, theta_list=theta_list, gamma=0.9)
+                                 extras=extras, gamma=0.9)
     dataset.reserve(capacity)
     return dataset
-
-
-def parsed_info(extra_info, key):
-    extra_info.parse()
-    return extra_info[key]
 
 
 def test_dataset_iadd_matches_add_in_place():
@@ -340,8 +356,8 @@ def test_dataset_iadd_matches_add_in_place():
     assert len(a) == 5
     assert np.array_equal(a.last, reference.last)
     assert np.array_equal(a.reward, reference.reward)
-    assert np.array_equal(parsed_info(a.info, 'idx'), parsed_info(reference.info, 'idx'))
-    assert np.array_equal(parsed_info(a.episode_info, 'ep'), parsed_info(reference.episode_info, 'ep'))
+    assert np.array_equal(a.info['idx'], reference.info['idx'])
+    assert np.array_equal(a.episode_info['ep'], reference.episode_info['ep'])
     assert np.array_equal(np.array(a.theta_list), np.array(reference.theta_list))
 
 
@@ -369,8 +385,8 @@ def test_dataset_iadd_falls_back_when_over_capacity():
     assert len(a) == 5
     assert np.array_equal(a.last, reference.last)
     assert np.array_equal(a.reward, reference.reward)
-    assert np.array_equal(parsed_info(a.info, 'idx'), parsed_info(reference.info, 'idx'))
-    assert np.array_equal(parsed_info(a.episode_info, 'ep'), parsed_info(reference.episode_info, 'ep'))
+    assert np.array_equal(a.info['idx'], reference.info['idx'])
+    assert np.array_equal(a.episode_info['ep'], reference.episode_info['ep'])
 
 
 def test_dataset_capacity_and_reserve():
@@ -453,3 +469,25 @@ def test_dataset_save_load_policy_split(tmpdir):
     assert np.array_equal(new_dataset.state, states)
     assert torch.equal(new_dataset.policy_state, torch.from_numpy(policy_states))
     assert new_dataset.n_episodes == 2
+
+
+def test_to_backend_converts_the_extra_info():
+    extras = ExtraInfo(1, 'torch')
+    extras.append_step({'x': torch.tensor(1.)})
+    extras.append_step({'x': torch.tensor(2.)})
+
+    n_steps = 2
+    state = torch.zeros(n_steps, 1)
+    action = torch.zeros(n_steps, 1)
+    reward = torch.zeros(n_steps)
+    next_state = torch.zeros(n_steps, 1)
+    absorbing = torch.zeros(n_steps, dtype=torch.bool)
+    last = torch.zeros(n_steps, dtype=torch.bool)
+    last[-1] = True
+
+    dataset = Dataset.from_array(state, action, reward, next_state, absorbing, last, extras=extras, backend='torch')
+    converted = dataset.to_backend('numpy')
+
+    assert isinstance(converted.state, np.ndarray)
+    assert isinstance(converted.info['x'], np.ndarray)
+    assert np.array_equal(converted.info['x'], np.array([1., 2.]))

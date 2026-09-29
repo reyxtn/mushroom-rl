@@ -1,6 +1,8 @@
 """
 This script shows how to train the Unitree Go2 velocity tracking task with PPO in MuJoCo Warp.
 
+The environment and reward follow the IsaacSim A1 example and Rudin et al., "Learning to Walk
+in Minutes Using Massively Parallel Deep Reinforcement Learning".
 
 """
 
@@ -135,20 +137,46 @@ def experiment(
     core = Core(agent, mdp, logger=logger)
 
     def measure_tracking(n_steps=200):
+        """
+        Mean squared velocity tracking error over the worlds still alive.
+
+        A world stops counting once it terminates (fall, or non-finite state):
+        it is never reset here, so its state afterwards is meaningless, and a
+        diverged world would turn the whole mean into NaN. The fraction of
+        worlds that went non-finite is returned separately, so divergence is
+        visible instead of hidden.
+
+        """
         mask = torch.ones(n_envs, dtype=torch.bool, device=mdp._device)
         obs, _ = mdp.reset_all(mask)
-        lin_acc = ang_acc = 0.0
+        alive = mask.clone()
+        diverged = torch.zeros_like(mask)
+        lin_sum = torch.zeros((), device=mdp._device)
+        ang_sum = torch.zeros((), device=mdp._device)
+        n = torch.zeros((), device=mdp._device)
         for _ in range(n_steps):
-            obs, *_ = mdp.step_all(mask, agent.policy.draw_action_greedy(obs))
+            obs, _, absorbing, _ = mdp.step_all(
+                mask, agent.policy.draw_action_greedy(obs)
+            )
             qvel = wp.to_torch(mdp._data_wp.qvel)
+            finite = torch.isfinite(qvel).all(dim=1)
+            diverged |= ~finite
+            alive &= finite & ~absorbing
             quat = mdp._read_data("base_rot")
             lin = mdp._quat_rotate_inverse(quat, qvel[:, 0:3])
             ang = qvel[:, 3:6]
-            lin_acc += ((mdp._commands[:, :2] - lin[:, :2]) ** 2).sum(
-                dim=1
-            ).mean().item() / n_steps
-            ang_acc += ((mdp._commands[:, 2] - ang[:, 2]) ** 2).mean().item() / n_steps
-        return lin_acc, ang_acc
+            lin_err = ((mdp._commands[:, :2] - lin[:, :2]) ** 2).sum(dim=1)
+            ang_err = (mdp._commands[:, 2] - ang[:, 2]) ** 2
+            # where() rather than multiplying by the mask: NaN * 0 is NaN.
+            lin_sum += torch.where(alive, lin_err, 0.0).sum()
+            ang_sum += torch.where(alive, ang_err, 0.0).sum()
+            n += alive.sum()
+        n = n.clamp(min=1)
+        return (
+            (lin_sum / n).item(),
+            (ang_sum / n).item(),
+            diverged.float().mean().item(),
+        )
 
     def evaluate(epoch):
         dataset = core.evaluate(n_episodes=n_episodes_test, render=False)
@@ -158,7 +186,7 @@ def experiment(
         L = dataset.episodes_length.float().mean().item()
         V = agent._V(dataset.get_init_states()).mean().item()
 
-        lin_err, ang_err = measure_tracking()
+        lin_err, ang_err, diverged_frac = measure_tracking()
 
         logger.log_evaluation(
             epoch,
@@ -169,6 +197,7 @@ def experiment(
             V=V,
             lin_vel_err=lin_err,
             ang_vel_err=ang_err,
+            diverged_frac=diverged_frac,
         )
         logger.log_best_agent(agent, J)
 

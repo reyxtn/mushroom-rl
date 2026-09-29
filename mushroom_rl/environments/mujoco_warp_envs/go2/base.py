@@ -1,12 +1,12 @@
-import os
-
+import mujoco
 import torch
 import warp as wp
 
 from mushroom_rl.core.spaces import Box
 from mushroom_rl.environments.mujoco import ObservationType
-from mushroom_rl.environments.mujoco_envs import __file__ as path_robots
 from mushroom_rl.environments.mujoco_warp import MuJoCoWarp
+
+from .vendor_go2 import ensure_go2_model
 
 import numpy as np
 
@@ -79,8 +79,6 @@ class Go2Base(MuJoCoWarp):
         healthy_gravity_z=-0.6,
         terminate_when_unhealthy=True,
         action_scale=0.25,
-        kp=20.0,
-        kd=0.5,
         soft_joint_limit=0.9,
         domain_randomization=True,
         push_interval=750,
@@ -106,8 +104,6 @@ class Go2Base(MuJoCoWarp):
                 robot is perfectly upright and 0 when it is on its side;
             action_scale (float): scaling from policy action to joint position
                 offset relative to the default pose;
-            kp (float): proportional gain of the joint position controller;
-            kd (float): derivative gain of the joint position controller;
             soft_joint_limit (float): fraction of the joint range, centred on
                 its midpoint, outside of which a limit penalty may apply;
             domain_randomization (bool): whether to randomise the initial pose
@@ -117,19 +113,18 @@ class Go2Base(MuJoCoWarp):
                 push, in m/s;
             n_substeps (int): physics steps per intermediate step;
             n_intermediate_steps (int): intermediate steps per environment
-                step. The PD controller is evaluated once per intermediate
-                step, so this sets the control rate. With the 0.002 s model
-                timestep the defaults give a 500 Hz control loop and a 50 Hz
-                policy rate. Running the PD at the policy rate instead leaves
-                the joints underdamped and the robot oscillates itself over;
-            scene (str): scene file to load. The mjx variant uses a reduced
-                solver iteration count and carries IMU sensors, which suits
-                batched GPU simulation.
+                step. With the 0.002 s model timestep and n_substeps=10 the
+                defaults give a 50 Hz policy rate. The joint PD is not
+                affected: it is the position actuator in the MJCF (kp=50,
+                kd=0.5), evaluated by MuJoCo every physics step;
+            scene (str): scene file to load. The model is not shipped with
+                the repository: if no copy is found it is fetched from
+                mujoco_menagerie on first use, see vendor_go2.py. Must use
+                position-type actuators, which rules out "scene.xml" (torque
+                motors); "scene_mjx.xml" is the supported choice.
 
         """
-        xml_path = os.path.join(
-            os.path.dirname(os.path.abspath(path_robots)), "data", "go2", scene
-        )
+        xml_path = str(ensure_go2_model(scene))
 
         # Base velocity in the base frame, then joint positions and
         # velocities. World position and orientation are deliberately not
@@ -152,8 +147,6 @@ class Go2Base(MuJoCoWarp):
         self._healthy_gravity_z = healthy_gravity_z
         self._terminate_when_unhealthy = terminate_when_unhealthy
         self._action_scale = action_scale
-        self._kp = kp
-        self._kd = kd
         self._soft_joint_limit = soft_joint_limit
         self._domain_randomization = domain_randomization
         self._push_interval = push_interval
@@ -185,6 +178,16 @@ class Go2Base(MuJoCoWarp):
     # ------------------------------------------------------------------
 
     def _modify_mdp_info(self, mdp_info):
+        # The action is mapped to a joint position target, which only works
+        # with position-type actuators (affine bias, MuJoCo evaluates the PD
+        # every physics step). With torque motors the same number would be
+        # applied as a torque, silently.
+        if not (self._model.actuator_biastype == mujoco.mjtBias.mjBIAS_AFFINE).all():
+            raise ValueError(
+                "Go2Base needs position-type actuators; the loaded scene uses "
+                "torque motors. Use scene='scene_mjx.xml'."
+            )
+
         dev = wp.to_torch(self._data_wp.qpos).device
         self._device = dev
 
@@ -255,8 +258,8 @@ class Go2Base(MuJoCoWarp):
         mdp_info.action_space = Box(action_low, action_high)
 
         mdp_info = super()._modify_mdp_info(mdp_info)
-        # self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.LS_ITERATIONS
-        # self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.ITERATIONS
+        self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.LS_ITERATIONS
+        self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.ITERATIONS
         mdp_info.observation_space = Box(*self.obs_helper.get_obs_limits())
         return mdp_info
 

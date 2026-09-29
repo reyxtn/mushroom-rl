@@ -1,7 +1,0 @@
-Unitree Go2 model
-Source: https://github.com/google-deepmind/mujoco_menagerie.git
-Path:   unitree_go2
-Commit: e4049d0a3bfd58d2a3081614e6777d4007e3f86a
-
-Vendored with tools/vendor_go2.py. Licensed under the terms in
-LICENSE (BSD-3-Clause, Unitree Robotics).

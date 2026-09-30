@@ -35,6 +35,7 @@ class H2Walk(H2Base):
     """
 
     _REWARD_KEYS = (
+        "alive",
         "tracking_lin_vel",
         "tracking_ang_vel",
         "lin_vel_z",
@@ -72,20 +73,21 @@ class H2Walk(H2Base):
         feet_air_time_threshold=0.4,
         feet_min_distance=0.18,
         base_height_target=0.96,
+        alive_weight=2.0,
         tracking_lin_vel_weight=1.0,
         tracking_ang_vel_weight=0.5,
         lin_vel_z_weight=2.0,
         ang_vel_xy_weight=0.05,
         orientation_weight=1.0,
         base_height_weight=10.0,
-        torque_weight=1e-5,
+        torque_weight=1e-6,
         joint_acc_weight=2.5e-7,
         action_rate_weight=0.01,
         joint_limit_weight=5.0,
-        joint_deviation_weight=0.5,
+        joint_deviation_weight=0.1,
         feet_air_time_weight=0.5,
         feet_slip_weight=0.2,
-        feet_clearance_weight=10.0,
+        feet_clearance_weight=2.0,
         feet_distance_weight=2.0,
         gait_weight=0.5,
         obs_noise=True,
@@ -121,8 +123,13 @@ class H2Walk(H2Base):
             base_height_target (float): pelvis height the height term pulls
                 towards, in metres. The keyframe stands at 1.01 and settles
                 around 0.96 under load;
+            alive_weight (float): reward per second for every step that does
+                not terminate. Makes surviving worth more than falling; without
+                it the penalties outweigh the positive terms early in training,
+                the total is clamped to zero, and there is no learning signal;
             *_weight (float): weights of the reward terms, per second. Every
-                term is multiplied by dt;
+                term is multiplied by dt. The penalty weights start small on
+                purpose: raise them once the robot walks, not before;
             obs_noise (bool): whether to add uniform noise to the observation.
 
         """
@@ -141,6 +148,7 @@ class H2Walk(H2Base):
         self._base_height_target = base_height_target
         self._obs_noise = obs_noise
 
+        self._w_alive = alive_weight
         self._w_tracking_lin = tracking_lin_vel_weight
         self._w_tracking_ang = tracking_ang_vel_weight
         self._w_lin_vel_z = lin_vel_z_weight
@@ -368,6 +376,10 @@ class H2Walk(H2Base):
     # ------------------------------------------------------------------
 
     def reward(self, obs, action, next_obs, absorbing):
+        # `action` here is what _preprocess_action returned: position targets
+        # for all 31 actuators. The action-rate term is on the policy output
+        # itself, which H2Base keeps in self._actions (n_joints wide).
+        policy_action = self._actions
         lin_vel = next_obs[:, self._lin_vel_slice]
         ang_vel = next_obs[:, self._ang_vel_slice]
         joint_pos = self._joint_pos()
@@ -380,6 +392,7 @@ class H2Walk(H2Base):
         dt = self.dt
 
         r = {
+            "alive": (~absorbing).float() * self._w_alive * dt,
             "tracking_lin_vel": self._reward_tracking_lin_vel(lin_vel[:, :2])
             * self._w_tracking_lin
             * dt,
@@ -392,7 +405,7 @@ class H2Walk(H2Base):
             "base_height": self._reward_base_height() * -self._w_base_height * dt,
             "torques": (torque**2).sum(dim=1) * -self._w_torque * dt,
             "joint_acc": self._reward_joint_acc(joint_vel) * -self._w_joint_acc * dt,
-            "action_rate": ((self._last_actions - action) ** 2).sum(dim=1)
+            "action_rate": ((self._last_actions - policy_action) ** 2).sum(dim=1)
             * -self._w_action_rate
             * dt,
             "joint_pos_limits": self._reward_joint_pos_limits(joint_pos)
@@ -423,7 +436,7 @@ class H2Walk(H2Base):
         # must be finite so it does not poison the whole batch through GAE.
         total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self._last_actions = action.clone()
+        self._last_actions = policy_action.clone()
         self._last_joint_vel = joint_vel.clone()
         self._last_foot_pos = foot_pos.clone()
 

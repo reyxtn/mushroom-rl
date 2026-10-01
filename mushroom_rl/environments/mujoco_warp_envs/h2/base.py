@@ -4,7 +4,7 @@ import torch
 import warp as wp
 
 from mushroom_rl.core.spaces import Box
-from mushroom_rl.environments.mujoco import ObservationType
+from mushroom_rl.utils.mujoco import ObservationType
 from mushroom_rl.environments.mujoco_warp import MuJoCoWarp
 
 from .vendor_h2 import ensure_h2_model

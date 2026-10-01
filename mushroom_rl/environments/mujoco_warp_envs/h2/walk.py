@@ -315,6 +315,10 @@ class H2Walk(H2Base):
         self._commands[env_indices[small], :2] = 0.0
 
     def _update_yaw_command(self):
+        # Teleoperation sets this flag to command a yaw rate directly instead
+        # of deriving it from the heading error (same convention as Go2Walk).
+        if getattr(self, "_direct_yaw", False):
+            return
         heading_error = self._wrap_to_pi(self._commands[:, 3] - self._heading())
         self._commands[:, 2] = torch.clamp(0.5 * heading_error, -1.0, 1.0)
 

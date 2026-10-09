@@ -91,13 +91,18 @@ OPTION = dict(
 JOINT_DYNAMICS = dict(damping="0.05", armature="0.01", frictionloss="0.2")
 
 # Foot contact parameters.
+# Group 3 keeps the boxes out of the default render (the viewer shows groups
+# 0-2), so they no longer cover the foot meshes; press 3 in the viewer to
+# show them. Translucent so the shoe stays visible when they are shown.
+# Group and rgba are visual only: contacts depend on contype/conaffinity.
 FOOT_GEOM = dict(
     condim="3",
     friction="0.8 0.02 0.01",
     priority="1",
     contype="1",
     conaffinity="1",
-    group="0",
+    group="3",
+    rgba="0.1 0.6 1.0 0.35",
 )
 
 # PD gains of the position actuators, (substring of joint name, kp, kd).

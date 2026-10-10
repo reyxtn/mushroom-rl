@@ -39,6 +39,7 @@ class MuJoCoWarp(VectorizedEnvironment):
         njmax=None,
         use_graph_capture=False,
         device=None,
+        model_batch_fields=None,
         **viewer_params,
     ):
         """
@@ -80,6 +81,12 @@ class MuJoCoWarp(VectorizedEnvironment):
                instead of dispatching each Warp kernel launch individually;
             device (str, None): the device the simulation data and every tensor returned by the environment live
                on. If None, the default torch device is used;
+            model_batch_fields (list, None): names of mujoco_warp Model fields to allocate with one entry per
+               world instead of one shared entry (e.g. ``["body_mass", "geom_friction"]``), so that they can be
+               set per world for domain randomization. Only fields whose mujoco_warp array spec starts with
+               ``*`` can be listed. The per-world values start as copies of the model's, and are edited in place
+               through ``wp.to_torch`` views; the arrays themselves must never be replaced once a step or a reset
+               has been graph-captured;
             **viewer_params: other parameters to be passed to the viewer.
                See MujocoViewer documentation for the available options.
 
@@ -109,7 +116,8 @@ class MuJoCoWarp(VectorizedEnvironment):
 
         self._sim_step_graph = None
 
-        self._model_wp = mj_warp.put_model(self._model)
+        batch_sizes = {name: num_envs for name in (model_batch_fields or ())}
+        self._model_wp = mj_warp.put_model(self._model, batch_sizes=batch_sizes)
         self._data_wp = mj_warp.make_data(
             self._model, nworld=num_envs, nconmax=nconmax, njmax=njmax
         )

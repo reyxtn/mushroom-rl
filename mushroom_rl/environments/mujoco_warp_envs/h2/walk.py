@@ -32,6 +32,12 @@ class H2Walk(H2Base):
     Contact is detected from the foot sole height, as the warp backend does
     not expose per-body contact forces.
 
+    With ``observed_randomization`` (an H2Base argument) the randomized
+    quantities named there are appended to the observation, after the gait
+    phase, for an asymmetric critic; :meth:`observation_indices` tells where
+    every named part of the observation sits, so the policy network can be
+    given everything but the privileged entries.
+
     """
 
     _REWARD_KEYS = (
@@ -209,6 +215,10 @@ class H2Walk(H2Base):
             mdp_info.action_space.high,
         )
         self.obs_helper.add_obs("gait_phase", 2, -1.0, 1.0)
+        spec = self.randomization_obs_spec()
+        for name in self._observed_randomization:
+            length, low, high = spec[name]
+            self.obs_helper.add_obs(name, length, low, high)
 
         norm_np = self._get_obs_normalization_vec()
         noise_np = self._get_noise_scale_vec()
@@ -245,6 +255,8 @@ class H2Walk(H2Base):
         v[cmd[2]] = 0.25
         v[self.obs_helper.obs_idx_map["actions"]] = 1.0
         v[self.obs_helper.obs_idx_map["gait_phase"]] = 1.0
+        for name in self._observed_randomization:
+            v[self.obs_helper.obs_idx_map[name]] = 1.0
         return v
 
     def _get_noise_scale_vec(self):
@@ -272,20 +284,23 @@ class H2Walk(H2Base):
         # Joint positions are kept absolute here because reward() reads them
         # for the limit penalty; the default offset is applied in
         # _modify_observation, after the reward has been computed.
-        return torch.cat(
-            [
-                obs,
-                self._projected_gravity(),
-                self._commands[:, :3],
-                self._actions,
-                self._gait_phase_obs(),
-            ],
-            dim=1,
-        )
+        parts = [
+            obs,
+            self._projected_gravity(),
+            self._commands[:, :3],
+            self._actions,
+            self._gait_phase_obs(),
+        ]
+        parts += [self.randomization_obs_value(name) for name in self._observed_randomization]
+        return torch.cat(parts, dim=1)
 
     def _modify_observation(self, obs):
         obs = obs.clone()
-        obs[:, self._joint_pos_slice] -= self._default_joint_pos
+        # The policy reads the joint angle the way a miscalibrated encoder
+        # would, offset from the truth by the same amount the controller
+        # targets are shifted by (see H2Base._preprocess_action).
+        offset = self._randomizer.position_offset[:, self._ctrl_idx]
+        obs[:, self._joint_pos_slice] -= self._default_joint_pos + offset
         obs *= self._normalization_vec
         if self._obs_noise:
             obs += (2.0 * torch.rand_like(obs) - 1.0) * self._noise_scale_vec
@@ -293,6 +308,65 @@ class H2Walk(H2Base):
         # observation still enters the dataset, so it must be finite.
         obs = torch.nan_to_num(obs, nan=0.0, posinf=100.0, neginf=-100.0)
         return torch.clamp(obs, min=-100.0, max=100.0)
+
+    def observation_indices(self, *names):
+        """
+        Where the named parts of the observation sit, as one sorted long
+        tensor, for an asymmetric actor-critic or a per-group preprocessor.
+
+        Names: ``base_ang_vel``, ``base_lin_vel``, ``base_vel`` (both),
+        ``joint_pos``, ``joint_vel``, ``projected_gravity``, ``commands``,
+        ``actions``, ``gait_phase`` and any name in ``observed_randomization``.
+
+        """
+        m = self.obs_helper.obs_idx_map
+        aliases = {
+            "base_ang_vel": list(range(self._ang_vel_slice.start, self._ang_vel_slice.stop)),
+            "base_lin_vel": list(range(self._lin_vel_slice.start, self._lin_vel_slice.stop)),
+            "joint_pos": list(range(self._joint_pos_slice.start, self._joint_pos_slice.stop)),
+            "joint_vel": list(range(self._joint_vel_slice.start, self._joint_vel_slice.stop)),
+        }
+        indices = []
+        for name in names:
+            if name in aliases:
+                indices += aliases[name]
+            elif name in m:
+                indices += list(m[name])
+            else:
+                raise ValueError(f"unknown observation {name!r}")
+        return torch.tensor(sorted(set(indices)), dtype=torch.long, device=self._device)
+
+    # Knobs a curriculum changes during training. Only new values are
+    # accepted here; when to change them is the training script's decision.
+
+    @property
+    def tracking_sigma(self):
+        return self._tracking_sigma
+
+    @tracking_sigma.setter
+    def tracking_sigma(self, value):
+        self._tracking_sigma = float(value)
+
+    @property
+    def command_ranges(self):
+        return dict(
+            lin_vel_x=self._lin_vel_x_range,
+            lin_vel_y=self._lin_vel_y_range,
+            heading=self._heading_range,
+        )
+
+    @command_ranges.setter
+    def command_ranges(self, ranges):
+        """Update any of ``lin_vel_x``, ``lin_vel_y``, ``heading``; others keep their value."""
+        unknown = set(ranges) - {"lin_vel_x", "lin_vel_y", "heading"}
+        if unknown:
+            raise ValueError(f"unknown command ranges: {sorted(unknown)}")
+        if "lin_vel_x" in ranges:
+            self._lin_vel_x_range = tuple(ranges["lin_vel_x"])
+        if "lin_vel_y" in ranges:
+            self._lin_vel_y_range = tuple(ranges["lin_vel_y"])
+        if "heading" in ranges:
+            self._heading_range = tuple(ranges["heading"])
 
     # ------------------------------------------------------------------
     # Commands and gait clock

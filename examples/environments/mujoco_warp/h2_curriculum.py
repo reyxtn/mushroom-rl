@@ -50,7 +50,9 @@ from mushroom_rl.core import Agent, Core, Logger
 from mushroom_rl.algorithms.actor_critic import PPO, RudinPPO
 from mushroom_rl.environments.mujoco_warp_envs import H2Run, H2Stand, H2Walk
 from mushroom_rl.environments.mujoco_warp_envs.h2 import MaskedActorNetwork
-from mushroom_rl.environments.mujoco_warp_envs.legged_randomizer import LeggedRandomizationParams
+from mushroom_rl.environments.mujoco_warp_envs.legged_randomizer import (
+    LeggedRandomizationParams,
+)
 from mushroom_rl.policy import GaussianTorchPolicy
 from mushroom_rl.approximators.parametric.networks import ActorNetwork
 from mushroom_rl.utils.torch_utils import TorchUtils
@@ -113,7 +115,7 @@ STAGE_CURRICULUM = dict(
         delay_stages=(0.3, 0.6),
         delay_steps=[0, 2, 4],
         sigma_window=(0.1, 0.5),
-        sigmas=(0.5, 0.15),
+        sigmas=(0.5, 0.25),
     ),
     run=dict(
         command_stages=(0.3, 0.6),
@@ -157,8 +159,17 @@ class Curriculum:
 
     """
 
-    def __init__(self, mdp, n_fits, command_stages, command_ranges, delay_stages, delay_steps,
-                 sigma_window, sigmas):
+    def __init__(
+        self,
+        mdp,
+        n_fits,
+        command_stages,
+        command_ranges,
+        delay_stages,
+        delay_steps,
+        sigma_window,
+        sigmas,
+    ):
         self._mdp = mdp
         self._n_fits = max(int(n_fits), 1)
         self._command_stages = tuple(command_stages)
@@ -194,11 +205,15 @@ class Curriculum:
         return min(max((self.fraction - start) / (end - start), 0.0), 1.0)
 
     def apply(self):
-        ranges = self._command_ranges[min(self.command_stage, len(self._command_ranges) - 1)]
+        ranges = self._command_ranges[
+            min(self.command_stage, len(self._command_ranges) - 1)
+        ]
         if ranges is not None:
             self._mdp.command_ranges = ranges
         if self._mdp.domain_randomization:
-            self._mdp.max_delay_steps = self._delay_steps[min(self.delay_stage, len(self._delay_steps) - 1)]
+            self._mdp.max_delay_steps = self._delay_steps[
+                min(self.delay_stage, len(self._delay_steps) - 1)
+            ]
         if self._sigmas is not None:
             start, end = self._sigmas
             self._mdp.tracking_sigma = start + self.progress * (end - start)
@@ -216,20 +231,38 @@ class Curriculum:
 # Agent
 # ----------------------------------------------------------------------
 
+
 def build_agent(mdp, args, batch_size, privileged):
     obs_shape = mdp.info.observation_space.shape
-    network_input_shape = (args.history_length,) + obs_shape if args.history_length > 1 else obs_shape
+    network_input_shape = (
+        (args.history_length,) + obs_shape if args.history_length > 1 else obs_shape
+    )
 
-    policy_kwargs = dict(std_0=args.std_0, n_features=args.n_features, activation=args.activation,
-                         gain_scale=args.gain_scale)
+    policy_kwargs = dict(
+        std_0=args.std_0,
+        n_features=args.n_features,
+        activation=args.activation,
+        gain_scale=args.gain_scale,
+    )
     if privileged:
         hidden = set(mdp.observation_indices(*privileged).tolist())
-        observed = torch.tensor([i for i in range(obs_shape[0]) if i not in hidden], dtype=torch.long)
-        policy = GaussianTorchPolicy(MaskedActorNetwork, network_input_shape, mdp.info.action_space.shape,
-                                     observed_indices=observed, **policy_kwargs)
+        observed = torch.tensor(
+            [i for i in range(obs_shape[0]) if i not in hidden], dtype=torch.long
+        )
+        policy = GaussianTorchPolicy(
+            MaskedActorNetwork,
+            network_input_shape,
+            mdp.info.action_space.shape,
+            observed_indices=observed,
+            **policy_kwargs,
+        )
     else:
-        policy = GaussianTorchPolicy(ActorNetwork, network_input_shape, mdp.info.action_space.shape,
-                                     **policy_kwargs)
+        policy = GaussianTorchPolicy(
+            ActorNetwork,
+            network_input_shape,
+            mdp.info.action_space.shape,
+            **policy_kwargs,
+        )
 
     adam = {"fused": True} if args.fused_adam else {}
     critic_params = dict(
@@ -255,7 +288,11 @@ def build_agent(mdp, args, batch_size, privileged):
     )
     if args.alg == "rudin":
         alg = RudinPPO
-        alg_params.update(clip_grad_norm=args.clip_grad_norm, schedule="adaptive", desired_kl=args.desired_kl)
+        alg_params.update(
+            clip_grad_norm=args.clip_grad_norm,
+            schedule="adaptive",
+            desired_kl=args.desired_kl,
+        )
     else:
         alg = PPO
     return alg(mdp.info, policy, critic_params=critic_params, **alg_params)
@@ -271,7 +308,10 @@ def warm_start(agent, path, reset_std=None):
 
     """
     loaded = Agent.load(path)
-    for name, mine, theirs in (("policy", agent.policy, loaded.policy), ("critic", agent._V, loaded._V)):
+    for name, mine, theirs in (
+        ("policy", agent.policy, loaded.policy),
+        ("critic", agent._V, loaded._V),
+    ):
         w = theirs.get_weights()
         if w.shape != mine.get_weights().shape:
             raise SystemExit(
@@ -287,6 +327,7 @@ def warm_start(agent, path, reset_std=None):
 # ----------------------------------------------------------------------
 # Evaluation
 # ----------------------------------------------------------------------
+
 
 def measure_tracking(mdp, agent, n_envs, n_steps=200):
     """
@@ -323,12 +364,19 @@ def measure_tracking(mdp, agent, n_envs, n_steps=200):
             term_sums[k] += torch.where(alive, mdp._reward_info[k], 0.0).sum()
     n = n.clamp(min=1)
     terms = {f"r_{k}": (v / n / mdp.dt).item() for k, v in term_sums.items()}
-    return (lin_sum / n).item(), (ang_sum / n).item(), diverged.float().mean().item(), alive.float().mean().item(), terms
+    return (
+        (lin_sum / n).item(),
+        (ang_sum / n).item(),
+        diverged.float().mean().item(),
+        alive.float().mean().item(),
+        terms,
+    )
 
 
 # ----------------------------------------------------------------------
 # One stage
 # ----------------------------------------------------------------------
+
 
 def parse_kv(items):
     out = {}
@@ -370,16 +418,35 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
     if args.wandb:
         wandb_kwargs = Logger.default_wandb_kwargs(
             args.wandb_project,
-            config=dict(stage=stage, seed=args.seed, init_agent=init_path, n_envs=n_envs, n_epochs=n_epochs,
-                        n_steps_per_fit=n_steps_per_fit, batch_size=batch_size, alg=args.alg,
-                        history_length=args.history_length, privileged=list(privileged), tf32=args.tf32,
-                        domain_randomization=dr_on, dr_params=dr_params, env_kwargs=env_kwargs,
-                        curriculum=STAGE_CURRICULUM[stage], actor_lr=args.actor_lr, critic_lr=args.critic_lr,
-                        std_0=args.std_0, ent_coeff=args.ent_coeff),
+            config=dict(
+                stage=stage,
+                seed=args.seed,
+                init_agent=init_path,
+                n_envs=n_envs,
+                n_epochs=n_epochs,
+                n_steps_per_fit=n_steps_per_fit,
+                batch_size=batch_size,
+                alg=args.alg,
+                history_length=args.history_length,
+                privileged=list(privileged),
+                tf32=args.tf32,
+                domain_randomization=dr_on,
+                dr_params=dr_params,
+                env_kwargs=env_kwargs,
+                curriculum=STAGE_CURRICULUM[stage],
+                actor_lr=args.actor_lr,
+                critic_lr=args.critic_lr,
+                std_0=args.std_0,
+                ent_coeff=args.ent_coeff,
+            ),
         )
     alg_name = "RudinPPO" if args.alg == "rudin" else "PPO"
-    logger = Logger(f"{alg_name}_{mdp.name()}", results_dir=str(seed_dir / "logs"), seed=args.seed,
-                    wandb_kwargs=wandb_kwargs)
+    logger = Logger(
+        f"{alg_name}_{mdp.name()}",
+        results_dir=str(seed_dir / "logs"),
+        seed=args.seed,
+        wandb_kwargs=wandb_kwargs,
+    )
 
     agent = build_agent(mdp, args, batch_size, privileged)
     if init_path is not None:
@@ -398,13 +465,27 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
         V = agent._V(dataset.get_init_states()).mean().item()
         lin_err, ang_err, diverged, alive, terms = measure_tracking(mdp, agent, n_envs)
         cur = curriculum.state()
-        logger.log_evaluation(epoch, J=J, R=R, entropy=E, mean_ep_len=L, V=V, lin_vel_err=lin_err,
-                              ang_vel_err=ang_err, diverged_frac=diverged, alive_frac=alive, **cur, **terms)
+        logger.log_evaluation(
+            epoch,
+            J=J,
+            R=R,
+            entropy=E,
+            mean_ep_len=L,
+            V=V,
+            lin_vel_err=lin_err,
+            ang_vel_err=ang_err,
+            diverged_frac=diverged,
+            alive_frac=alive,
+            **cur,
+            **terms,
+        )
         logger.log_best_agent(agent, J)
-        line = (f"{time.strftime('%d/%m/%Y %H:%M:%S')} [INFO] Epoch {epoch} | J: {J} R: {R} entropy: {E} "
-                f"mean_ep_len: {L} V: {V} lin_vel_err: {lin_err} ang_vel_err: {ang_err} "
-                f"diverged_frac: {diverged} alive_frac: {alive} "
-                + " ".join(f"{k}: {v}" for k, v in {**cur, **terms}.items()))
+        line = (
+            f"{time.strftime('%d/%m/%Y %H:%M:%S')} [INFO] Epoch {epoch} | J: {J} R: {R} entropy: {E} "
+            f"mean_ep_len: {L} V: {V} lin_vel_err: {lin_err} ang_vel_err: {ang_err} "
+            f"diverged_frac: {diverged} alive_frac: {alive} "
+            + " ".join(f"{k}: {v}" for k, v in {**cur, **terms}.items())
+        )
         stage_log.write(line + "\n")
         stage_log.flush()
         if J > best["J"]:
@@ -425,8 +506,10 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
     (seed_dir / f"{stage}.best").write_text(
         f"{best['epoch']} {best['J']} {best['ep_len']} {best['lin_err']} {best['alive']}\n"
     )
-    print(f"[curriculum] {stage} done: best epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
-          f"lin_vel_err={best['lin_err']:.3f} alive={best['alive']:.3f} -> {out}")
+    print(
+        f"[curriculum] {stage} done: best epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
+        f"lin_vel_err={best['lin_err']:.3f} alive={best['alive']:.3f} -> {out}"
+    )
 
     mdp.stop()
     del core, agent, mdp
@@ -438,38 +521,94 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
 # Main
 # ----------------------------------------------------------------------
 
+
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--seed", type=int, required=True)
-    p.add_argument("--run-dir", default="runs/h2_curriculum", help="sweep folder; this seed goes to seed_<seed>/")
+    p.add_argument(
+        "--run-dir",
+        default="runs/h2_curriculum",
+        help="sweep folder; this seed goes to seed_<seed>/",
+    )
     p.add_argument("--stages", nargs="+", choices=STAGES, default=list(STAGES))
-    p.add_argument("--init-agent", default=None, help="checkpoint the first stage warm-starts from")
-    p.add_argument("--reset-std", type=float, default=None,
-                   help="policy std to reset to after every warm start (default: keep the checkpoint's)")
-    p.add_argument("--force", action="store_true", help="ignore the gates between stages")
+    p.add_argument(
+        "--init-agent", default=None, help="checkpoint the first stage warm-starts from"
+    )
+    p.add_argument(
+        "--reset-std",
+        type=float,
+        default=None,
+        help="policy std to reset to after every warm start (default: keep the checkpoint's)",
+    )
+    p.add_argument(
+        "--force", action="store_true", help="ignore the gates between stages"
+    )
     for s in STAGES:
         p.add_argument(f"--{s}-epochs", type=int, default=STAGE_EPOCHS[s])
-        p.add_argument(f"--{s}-min-ep-len", type=float, default=STAGE_MIN_EP_LEN[s],
-                       help=f"gate: the next stage runs only if {s} reached this episode length")
-        p.add_argument(f"--{s}-arg", action="append", default=[], metavar="KEY=VALUE",
-                       help=f"environment argument for the {s} stage only")
-    p.add_argument("--env-arg", action="append", default=[], metavar="KEY=VALUE",
-                   help="environment argument for every stage (Python literal)")
+        p.add_argument(
+            f"--{s}-min-ep-len",
+            type=float,
+            default=STAGE_MIN_EP_LEN[s],
+            help=f"gate: the next stage runs only if {s} reached this episode length",
+        )
+        p.add_argument(
+            f"--{s}-arg",
+            action="append",
+            default=[],
+            metavar="KEY=VALUE",
+            help=f"environment argument for the {s} stage only",
+        )
+    p.add_argument(
+        "--env-arg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="environment argument for every stage (Python literal)",
+    )
 
     g = p.add_argument_group("domain randomization")
-    g.add_argument("--no-dr", action="store_true", help="nominal model, no pushes, deterministic resets")
-    g.add_argument("--dr", action="append", default=[], metavar="KEY=VALUE",
-                   help="override a LeggedRandomizationParams entry, e.g. --dr position_offset=0.04")
-    g.add_argument("--privileged", nargs="*", default=list(DEFAULT_PRIVILEGED),
-                   help="observation entries only the critic sees (names from H2Walk.observation_indices, "
-                        "e.g. actual_delay joint_calib_offset base_lin_vel); pass none for a symmetric agent")
+    g.add_argument(
+        "--no-dr",
+        action="store_true",
+        help="nominal model, no pushes, deterministic resets",
+    )
+    g.add_argument(
+        "--dr",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="override a LeggedRandomizationParams entry, e.g. --dr position_offset=0.04",
+    )
+    g.add_argument(
+        "--privileged",
+        nargs="*",
+        default=list(DEFAULT_PRIVILEGED),
+        help="observation entries only the critic sees (names from H2Walk.observation_indices, "
+        "e.g. actual_delay joint_calib_offset base_lin_vel); pass none for a symmetric agent",
+    )
 
     g = p.add_argument_group("algorithm")
-    g.add_argument("--alg", choices=("rudin", "ppo"), default="rudin",
-                   help="RudinPPO (adaptive learning rate from the policy KL, gradient clipping) or plain PPO")
-    g.add_argument("--history-length", type=int, default=1, help="stacked observations the networks read")
+    g.add_argument(
+        "--alg",
+        choices=("rudin", "ppo"),
+        default="rudin",
+        help="RudinPPO (adaptive learning rate from the policy KL, gradient clipping) or plain PPO",
+    )
+    g.add_argument(
+        "--history-length",
+        type=int,
+        default=1,
+        help="stacked observations the networks read",
+    )
     g.add_argument("--n-envs", type=int, default=4096)
-    g.add_argument("--fragment-length", type=int, default=24, help="on-policy steps per environment per fit")
+    g.add_argument(
+        "--fragment-length",
+        type=int,
+        default=24,
+        help="on-policy steps per environment per fit",
+    )
     g.add_argument("--fits-per-epoch", type=int, default=10)
     g.add_argument("--n-minibatches", type=int, default=16)
     g.add_argument("--n-epochs-policy", type=int, default=5)
@@ -490,8 +629,11 @@ def parse_args():
     g.add_argument("--no-fused-adam", action="store_false", dest="fused_adam")
 
     g = p.add_argument_group("compute")
-    g.add_argument("--tf32", action="store_true",
-                   help="run the matrix multiplications of the networks in TF32 on the tensor cores")
+    g.add_argument(
+        "--tf32",
+        action="store_true",
+        help="run the matrix multiplications of the networks in TF32 on the tensor cores",
+    )
     g.add_argument("--no-graph-capture", action="store_false", dest="graph_capture")
     g.add_argument("--no-wandb", action="store_false", dest="wandb")
     g.add_argument("--wandb-project", default="mushroom_rl_h2")
@@ -519,23 +661,33 @@ def main():
     run_dir = Path(args.run_dir)
     seed_dir = run_dir / f"seed_{args.seed}"
     seed_dir.mkdir(parents=True, exist_ok=True)
-    git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
-                         cwd=Path(__file__).resolve().parent).stdout.strip() or "unknown"
+    git = (
+        subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parent,
+        ).stdout.strip()
+        or "unknown"
+    )
     config = run_dir / "config.txt"
     if not config.exists():
         config.write_text(
             "\n".join(
-                [f"stages={' '.join(args.stages)} alg={args.alg} history_length={args.history_length} tf32={args.tf32}",
-                 f"epochs stand={args.stand_epochs} walk={args.walk_epochs} run={args.run_epochs} "
-                 f"fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs}",
-                 f"domain_randomization={not args.no_dr} dr_params={dr_params}",
-                 f"privileged={list(privileged)}",
-                 f"gates stand_min_ep_len={args.stand_min_ep_len} walk_min_ep_len={args.walk_min_ep_len}",
-                 f"env_arg={args.env_arg} stand_arg={args.stand_arg} walk_arg={args.walk_arg} run_arg={args.run_arg}",
-                 f"stage_env_args={STAGE_ENV_ARGS}",
-                 f"curriculum={STAGE_CURRICULUM}",
-                 f"std_0={args.std_0} ent_coeff={args.ent_coeff} actor_lr={args.actor_lr} critic_lr={args.critic_lr}",
-                 f"git={git}", ""]
+                [
+                    f"stages={' '.join(args.stages)} alg={args.alg} history_length={args.history_length} tf32={args.tf32}",
+                    f"epochs stand={args.stand_epochs} walk={args.walk_epochs} run={args.run_epochs} "
+                    f"fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs}",
+                    f"domain_randomization={not args.no_dr} dr_params={dr_params}",
+                    f"privileged={list(privileged)}",
+                    f"gates stand_min_ep_len={args.stand_min_ep_len} walk_min_ep_len={args.walk_min_ep_len}",
+                    f"env_arg={args.env_arg} stand_arg={args.stand_arg} walk_arg={args.walk_arg} run_arg={args.run_arg}",
+                    f"stage_env_args={STAGE_ENV_ARGS}",
+                    f"curriculum={STAGE_CURRICULUM}",
+                    f"std_0={args.std_0} ent_coeff={args.ent_coeff} actor_lr={args.actor_lr} critic_lr={args.critic_lr}",
+                    f"git={git}",
+                    "",
+                ]
             )
         )
 
@@ -543,12 +695,16 @@ def main():
     status = "ok"
     try:
         for i, stage in enumerate(args.stages):
-            out, best = run_stage(stage, args, seed_dir, init_path, dr_params, privileged)
+            out, best = run_stage(
+                stage, args, seed_dir, init_path, dr_params, privileged
+            )
             init_path = str(out)
             gate = getattr(args, f"{stage}_min_ep_len")
             if i + 1 < len(args.stages) and not args.force and best["ep_len"] < gate:
                 status = f"gated: {stage} best ep_len {best['ep_len']:.1f} < {gate}"
-                print(f"[curriculum] {status}; not starting {args.stages[i + 1]} (use --force to override)")
+                print(
+                    f"[curriculum] {status}; not starting {args.stages[i + 1]} (use --force to override)"
+                )
                 break
     except Exception as e:  # noqa: BLE001 - recorded in status for the sweep
         (seed_dir / "status").write_text(f"failed: {type(e).__name__}: {e}\n")

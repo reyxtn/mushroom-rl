@@ -152,8 +152,8 @@ class H2Base(MuJoCoWarp):
         init_vel_noise=None,
         push_interval=None,
         push_max_vel=None,
-        n_substeps=10,
-        n_intermediate_steps=1,
+        n_substeps=2,
+        n_intermediate_steps=5,
         use_graph_capture=False,
         nconmax=None,
         njmax=256,
@@ -220,7 +220,11 @@ class H2Base(MuJoCoWarp):
 
         if isinstance(randomization_params, dict):
             randomization_params = LeggedRandomizationParams(**randomization_params)
-        params = LeggedRandomizationParams() if randomization_params is None else randomization_params
+        params = (
+            LeggedRandomizationParams()
+            if randomization_params is None
+            else randomization_params
+        )
         if init_joint_noise is not None:
             params["reset_joint_noise"] = init_joint_noise
         if init_vel_noise is not None:
@@ -281,7 +285,9 @@ class H2Base(MuJoCoWarp):
                 "H2Base needs position-type actuators; rebuild the model with vendor_h2.py"
             )
         if m.nu != self._n_actuators:
-            raise ValueError(f"model has {m.nu} actuators, expected {self._n_actuators}")
+            raise ValueError(
+                f"model has {m.nu} actuators, expected {self._n_actuators}"
+            )
         # _set_ctrl below writes the whole ctrl row of a world at once, which
         # needs the actuation spec to cover every actuator in model order.
         if not np.array_equal(np.asarray(self._action_indices), np.arange(m.nu)):
@@ -300,15 +306,24 @@ class H2Base(MuJoCoWarp):
             jid(j)
         ctrl_jids = [jid(j) for j in self._controlled_joints]
         act_jids = m.actuator_trnid[:, 0]
-        self._all_qpos_idx = torch.as_tensor(m.jnt_qposadr[act_jids], device=dev, dtype=torch.long)
-        self._qpos_idx = torch.as_tensor(m.jnt_qposadr[ctrl_jids], device=dev, dtype=torch.long)
-        self._dof_idx = torch.as_tensor(m.jnt_dofadr[ctrl_jids], device=dev, dtype=torch.long)
+        self._all_qpos_idx = torch.as_tensor(
+            m.jnt_qposadr[act_jids], device=dev, dtype=torch.long
+        )
+        self._qpos_idx = torch.as_tensor(
+            m.jnt_qposadr[ctrl_jids], device=dev, dtype=torch.long
+        )
+        self._dof_idx = torch.as_tensor(
+            m.jnt_dofadr[ctrl_jids], device=dev, dtype=torch.long
+        )
 
         act_ids = [
-            mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, j) for j in self._controlled_joints
+            mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, j)
+            for j in self._controlled_joints
         ]
         if min(act_ids) < 0:
-            raise ValueError("every controlled joint needs an actuator of the same name")
+            raise ValueError(
+                "every controlled joint needs an actuator of the same name"
+            )
         self._ctrl_idx = torch.as_tensor(act_ids, device=dev, dtype=torch.long)
 
         posture_jids = [
@@ -333,17 +348,28 @@ class H2Base(MuJoCoWarp):
         self._soft_joint_upper = mid + half
 
         ctrlrange = m.actuator_ctrlrange
-        self._ctrl_lower = torch.as_tensor(ctrlrange[:, 0], dtype=torch.float32, device=dev)
-        self._ctrl_upper = torch.as_tensor(ctrlrange[:, 1], dtype=torch.float32, device=dev)
+        self._ctrl_lower = torch.as_tensor(
+            ctrlrange[:, 0], dtype=torch.float32, device=dev
+        )
+        self._ctrl_upper = torch.as_tensor(
+            ctrlrange[:, 1], dtype=torch.float32, device=dev
+        )
 
         self._feet_geom_ids = torch.as_tensor(
-            [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, g) for g in self.FEET_GEOMS],
+            [
+                mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, g)
+                for g in self.FEET_GEOMS
+            ],
             device=dev,
         )
         if (self._feet_geom_ids < 0).any():
-            raise ValueError("foot geoms not found; rebuild the model with vendor_h2.py")
+            raise ValueError(
+                "foot geoms not found; rebuild the model with vendor_h2.py"
+            )
         self._foot_half_height = torch.as_tensor(
-            m.geom_size[self._feet_geom_ids.cpu().numpy(), 2], dtype=torch.float32, device=dev
+            m.geom_size[self._feet_geom_ids.cpu().numpy(), 2],
+            dtype=torch.float32,
+            device=dev,
         )
 
         self._actions = torch.zeros(self._num_envs, self._n_joints, device=dev)
@@ -388,7 +414,8 @@ class H2Base(MuJoCoWarp):
             b = int(m.body_parentid[b]) if b != 0 else -1
 
         self._model_views = {
-            name: wp.to_torch(getattr(self._model_wp, name)) for name in self.BATCHED_MODEL_FIELDS
+            name: wp.to_torch(getattr(self._model_wp, name))
+            for name in self.BATCHED_MODEL_FIELDS
         }
         for name, view in self._model_views.items():
             if view.shape[0] != self._num_envs:
@@ -416,7 +443,9 @@ class H2Base(MuJoCoWarp):
 
         # Action history for the latency, one slot per intermediate step.
         L = self._max_delay_steps_limit + 1
-        self._action_history = self._default_ctrl.expand(L, self._num_envs, m.nu).clone()
+        self._action_history = self._default_ctrl.expand(
+            L, self._num_envs, m.nu
+        ).clone()
         self._history_head = 0
 
         if self._domain_randomization:
@@ -450,6 +479,15 @@ class H2Base(MuJoCoWarp):
             self._randomizer.resample_startup(self._all_envs)
         else:
             self._randomizer.reset_to_nominal()
+
+    @property
+    def max_delay_steps_limit(self):
+        """
+        The number of intermediate steps the action history was sized for;
+        ``max_delay_steps`` cannot be raised above it.
+
+        """
+        return self._max_delay_steps_limit
 
     @property
     def max_delay_steps(self):
@@ -511,7 +549,9 @@ class H2Base(MuJoCoWarp):
         p = self._randomization_params
         c = self._ctrl_idx
         if name == "actual_delay":
-            return r.delay_steps.unsqueeze(1).float() / max(self._max_delay_steps_limit, 1)
+            return r.delay_steps.unsqueeze(1).float() / max(
+                self._max_delay_steps_limit, 1
+            )
         if name == "joint_calib_offset":
             return r.position_offset[:, c] / max(float(p["position_offset"]), 1e-3)
         if name == "p_gain":
@@ -519,7 +559,9 @@ class H2Base(MuJoCoWarp):
         if name == "d_gain":
             return r.seen_parameters["d_gain"][:, c] / d["kd"][c]
         if name == "mass":
-            return (r.seen_parameters["mass"] / float(self._model.body_subtreemass[0])).unsqueeze(1)
+            return (
+                r.seen_parameters["mass"] / float(self._model.body_subtreemass[0])
+            ).unsqueeze(1)
         if name == "torque_limit":
             return r.seen_parameters["torque_limit"][:, c] / d["forcerange"][c, 1]
         if name == "action_scaling_factor":
@@ -527,7 +569,9 @@ class H2Base(MuJoCoWarp):
             return (r.scaling_factor - d["action_scale"]) / max(abs(lo), abs(hi), 1e-3)
         if name == "joint_nominal_offset":
             lo, hi = p["add_joint_nominal_position"]
-            return (r.joint_nominal_pos[:, c] - d["joint_nominal_pos"][c]) / max(abs(lo), abs(hi), 1e-3)
+            return (r.joint_nominal_pos[:, c] - d["joint_nominal_pos"][c]) / max(
+                abs(lo), abs(hi), 1e-3
+            )
         raise ValueError(f"unknown randomized observation {name!r}")
 
     # ------------------------------------------------------------------
@@ -621,7 +665,9 @@ class H2Base(MuJoCoWarp):
     def _heading(self):
         """Yaw angle of the pelvis forward axis, in radians. (W,)"""
         quat = self._read_data("base_rot")
-        fwd = torch.tensor([1.0, 0.0, 0.0], device=self._device).expand(quat.shape[0], 3)
+        fwd = torch.tensor([1.0, 0.0, 0.0], device=self._device).expand(
+            quat.shape[0], 3
+        )
         fwd = self._quat_rotate(quat, fwd)
         return torch.atan2(fwd[:, 1], fwd[:, 0])
 
@@ -668,7 +714,9 @@ class H2Base(MuJoCoWarp):
         return self._projected_gravity()[:, 2] <= self._healthy_gravity_z
 
     def _is_healthy(self, obs):
-        return self._is_finite(obs) & self._is_within_z_range(obs) & self._is_upright(obs)
+        return (
+            self._is_finite(obs) & self._is_within_z_range(obs) & self._is_upright(obs)
+        )
 
     # ------------------------------------------------------------------
     # Reset and domain randomisation
@@ -709,9 +757,15 @@ class H2Base(MuJoCoWarp):
             quat[:, 3] = torch.sin(0.5 * yaw)
             qpos[idx, 3:7] = quat
 
-            noise = (torch.rand(n, self._n_joints, device=qpos.device) * 2 - 1) * p["reset_joint_noise"]
-            qpos[idx.unsqueeze(1), self._qpos_idx.unsqueeze(0)] = self._default_joint_pos + noise
-            qvel[idx, 0:2] = (torch.rand(n, 2, device=qpos.device) * 2 - 1) * p["reset_base_velocity"]
+            noise = (torch.rand(n, self._n_joints, device=qpos.device) * 2 - 1) * p[
+                "reset_joint_noise"
+            ]
+            qpos[idx.unsqueeze(1), self._qpos_idx.unsqueeze(0)] = (
+                self._default_joint_pos + noise
+            )
+            qvel[idx, 0:2] = (torch.rand(n, 2, device=qpos.device) * 2 - 1) * p[
+                "reset_base_velocity"
+            ]
 
         # Flush the latency buffer of the reset worlds with their nominal
         # target, so a delayed read cannot return the previous episode.
@@ -726,7 +780,9 @@ class H2Base(MuJoCoWarp):
     def _step_finalize(self):
         self._episode_length += 1
         if self._domain_randomization:
-            push_idx, vel = self._randomizer.sample_disturbance(self._episode_length, self.dt)
+            push_idx, vel = self._randomizer.sample_disturbance(
+                self._episode_length, self.dt
+            )
             self._push_robots(push_idx, vel)
 
     def _push_robots(self, env_indices, velocities):

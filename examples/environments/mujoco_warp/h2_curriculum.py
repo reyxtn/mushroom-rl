@@ -58,7 +58,7 @@ from mushroom_rl.approximators.parametric.networks import ActorNetwork
 from mushroom_rl.utils.torch_utils import TorchUtils
 
 TASKS = {"stand": H2Stand, "walk": H2Walk, "run": H2Run}
-STAGES = ("stand", "walk", "run")
+STAGES = ("stand", "walk")
 
 # ----------------------------------------------------------------------
 # Defaults per stage. Everything here can be overridden from the command

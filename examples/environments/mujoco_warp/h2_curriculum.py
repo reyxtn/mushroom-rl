@@ -481,7 +481,7 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
         E = agent.policy.entropy().item()
         L = dataset.episodes_length.float().mean().item()
         V = agent._V(dataset.get_init_states()).mean().item()
-        lin_err, ang_err, diverged, alive, terms = measure_tracking(mdp, agent, n_envs)
+        lin_err, ang_err, diverged, alive, terms = measure_tracking(mdp, agent, n_envs, args.tracking_steps)
         cur = curriculum.state()
         logger.log_evaluation(epoch, J=J, R=R, entropy=E, mean_ep_len=L, V=V, lin_vel_err=lin_err,
                               ang_vel_err=ang_err, diverged_frac=diverged, alive_frac=alive, **cur, **terms)
@@ -500,10 +500,15 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
                 best.update(J=J, epoch=epoch, ep_len=L, lin_err=lin_err, alive=alive)
         del dataset
 
+    # Every evaluation steps all n_envs worlds until n_episodes_test of them
+    # end (up to the horizon) plus tracking_steps more, which with a policy
+    # that survives costs as much as several epochs of training; so only
+    # every eval_every epochs, and always at the last one.
     evaluate(0)
     for it in trange(n_epochs, leave=False, desc=f"seed {args.seed} {stage}"):
         core.learn(n_steps=n_steps, n_steps_per_fit=n_steps_per_fit)
-        evaluate(it + 1)
+        if (it + 1) % args.eval_every == 0 or it + 1 == n_epochs:
+            evaluate(it + 1)
     stage_log.close()
 
     ckpts = sorted((seed_dir / "logs").rglob("agent*-best.msh"), key=os.path.getmtime)
@@ -570,6 +575,10 @@ def parse_args():
     g.add_argument("--n-epochs-policy", type=int, default=5)
     g.add_argument("--n-epochs-critic", type=int, default=1, help="critic passes per fit (the old script used 1)")
     g.add_argument("--n-episodes-test", type=int, default=256)
+    g.add_argument("--eval-every", type=int, default=1,
+                   help="evaluate (and consider for the best checkpoint) every N epochs, and at the last")
+    g.add_argument("--tracking-steps", type=int, default=200,
+                   help="policy steps of the greedy roll-out that measures lin/ang_vel_err at every evaluation")
     g.add_argument("--actor-lr", type=float, default=3e-4)
     g.add_argument("--critic-lr", type=float, default=3e-4)
     g.add_argument("--desired-kl", type=float, default=0.01)

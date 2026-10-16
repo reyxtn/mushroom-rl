@@ -101,7 +101,7 @@ STAGE_CURRICULUM = dict(
         command_stages=(),
         command_ranges=[None],
         delay_stages=(0.3, 0.6),
-        delay_steps=[0, 2, 4],
+        delay_steps=[0, 0, 1],
         sigma_window=None,
         sigmas=None,
     ),

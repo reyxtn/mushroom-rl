@@ -9,7 +9,8 @@ backend, plus the stage chain that used to live in ``h2_sweep.sh``.
     python h2_curriculum.py --seed 1 --tf32 --alg rudin --history-length 1
     python h2_curriculum.py --seed 1 --stages walk run --init-agent runs/x/seed_1/stand.msh
     python h2_curriculum.py --seed 1 --no-dr                     # nominal model, no pushes
-    python h2_curriculum.py --seed 1 --old-dr --no-curriculum    # the old h2_sweep.sh setup
+    python h2_curriculum.py --seed 1 --old-dr --no-curriculum --privileged none \
+        --stand-epochs 40 --walk-epochs 60 --run-epochs 60        # the old h2_sweep.sh setup
     python h2_curriculum.py --seed 1 --dr add_trunk_mass="(-5,10)" --dr max_delay=0.01
 
 Every seed writes to ``<run-dir>/seed_<seed>/``: ``<stage>.msh`` (best
@@ -79,11 +80,12 @@ STAGE_EPOCHS = dict(stand=40, walk=80, run=80)
 STAGE_MIN_EP_LEN = dict(stand=200.0, walk=700.0, run=0.0)
 
 # Reward and push settings of the previous sweeps: survival worth less than
-# tracking, posture and stillness paid for. Stand keeps the env reward
-# defaults (it needs the large alive bonus to learn to balance at all); its
-# push is the old H2Base default, the randomizer's own default is 1 m/s.
+# tracking, posture and stillness paid for. Stand keeps the env defaults (it
+# needs the large alive bonus to learn to balance at all, and H2Stand sets
+# its own pushes: 0.8 m/s every 250 steps). The push kwargs are mapped onto
+# the randomizer's push_max_velocity / push_probability by H2Base.
 STAGE_ENV_ARGS = dict(
-    stand=dict(push_max_vel=0.5),
+    stand={},
     walk=dict(
         alive_weight=0.5,
         tracking_lin_vel_weight=2.0,
@@ -138,8 +140,8 @@ STAGE_CURRICULUM = dict(
         ],
         delay_stages=(0.3, 0.6),
         delays=[0.0, 0.01, 0.02],
-        sigma_window=(0.1, 0.5),
-        sigmas=(0.5, 0.25),
+        sigma_window=None,  # H2Run's own tracking_sigma (0.5) throughout, as before
+        sigmas=None,
     ),
 )
 
@@ -160,6 +162,10 @@ DR_DEFAULTS = dict(
     mixed_chance=0.0,
     position_offset=0.02,
     reset_yaw_range=math.pi,
+    # The H2 model's spring reference (qpos_spring) is the all-zero pose, not
+    # the standing keyframe, so a joint stiffness would pull the robot away
+    # from its nominal pose. Kept inert whatever stay_at_default_percentage is.
+    joint_stiffness=(0.0, 0.0),
 )
 
 # What the old H2Base did under the name "domain randomization": random
@@ -412,6 +418,10 @@ def parse_kv(items):
 
 
 def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
+    # Every stage starts from the same RNG state, as it did when each stage
+    # was its own process.
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     n_envs = args.n_envs
     n_steps_per_fit = n_envs * args.fragment_length
     n_steps = n_steps_per_fit * args.fits_per_epoch
@@ -432,14 +442,17 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
     params = dict(dr_params)
     max_delay = params.pop("max_delay")
     schedule = dict(STAGE_CURRICULUM[stage])
-    params["max_delay_steps"] = delay_to_steps(max(max_delay, *schedule["delays"]) if dr_on else 0.0, idt)
+    # max_delay is the ceiling; the schedule's delays are clamped to it (in
+    # Curriculum), never the other way round, so --dr max_delay=0 and
+    # --old-dr really mean no latency.
+    params["max_delay_steps"] = delay_to_steps(max_delay if dr_on else 0.0, idt)
 
     mdp = env_cls(
         num_envs=n_envs,
         use_graph_capture=args.graph_capture,
         domain_randomization=dr_on,
         randomization_params=LeggedRandomizationParams(**params),
-        observed_randomization=privileged,
+        observed_randomization=tuple(n for n in privileged if n in env_cls.RANDOMIZATION_OBS),
         **env_kwargs,
     )
     if abs(mdp.dt / mdp._n_intermediate_steps - idt) > 1e-9:
@@ -453,8 +466,11 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
 
     wandb_kwargs = None
     if args.wandb:
+        run_name = Path(args.run_dir).name
         wandb_kwargs = Logger.default_wandb_kwargs(
             args.wandb_project,
+            group=f"{run_name}/seed_{args.seed}",
+            name=f"{run_name}-s{args.seed}-{stage}",
             config=dict(stage=stage, seed=args.seed, init_agent=init_path, n_envs=n_envs, n_epochs=n_epochs,
                         n_steps_per_fit=n_steps_per_fit, batch_size=batch_size, alg=args.alg,
                         history_length=args.history_length, privileged=list(privileged), tf32=args.tf32,
@@ -496,7 +512,7 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
         # best checkpoint is only tracked once it is.
         if curriculum.complete:
             logger.log_best_agent(agent, J)
-            if J > best["J"]:
+            if J >= best["J"]:  # the logger saves on >= too
                 best.update(J=J, epoch=epoch, ep_len=L, lin_err=lin_err, alive=alive)
         del dataset
 
@@ -511,6 +527,9 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
             evaluate(it + 1)
     stage_log.close()
 
+    if "epoch" not in best:
+        raise SystemExit(f"{stage}: no evaluation ran after the schedule completed; "
+                         "lower --eval-every or raise --{stage}-epochs")
     ckpts = sorted((seed_dir / "logs").rglob("agent*-best.msh"), key=os.path.getmtime)
     if not ckpts:
         raise SystemExit(f"no checkpoint saved for {stage}")
@@ -522,6 +541,7 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
     print(f"[curriculum] {stage} done: best epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
           f"lin_vel_err={best['lin_err']:.3f} alive={best['alive']:.3f} -> {out}")
 
+    logger.finish()  # one wandb run per stage; without this the next stage logs into this one
     mdp.stop()
     del core, agent, mdp
     torch.cuda.empty_cache()
@@ -573,7 +593,8 @@ def parse_args():
     g.add_argument("--fits-per-epoch", type=int, default=10)
     g.add_argument("--n-minibatches", type=int, default=16)
     g.add_argument("--n-epochs-policy", type=int, default=5)
-    g.add_argument("--n-epochs-critic", type=int, default=1, help="critic passes per fit (the old script used 1)")
+    g.add_argument("--n-epochs-critic", type=int, default=10,
+                   help="critic passes per fit; 10 is mushroom's PPO default, which the old h2_ppo.py used")
     g.add_argument("--n-episodes-test", type=int, default=256)
     g.add_argument("--eval-every", type=int, default=1,
                    help="evaluate (and consider for the best checkpoint) every N epochs, and at the last")
@@ -625,6 +646,11 @@ def main():
         raise SystemExit(f"unknown --dr entries: {sorted(unknown)}")
     if "max_delay_steps" in dr_params:
         raise SystemExit("the latency is given in seconds now: --dr max_delay=0.02, not max_delay_steps")
+    pushes = {"push_max_velocity", "push_probability", "push_interval_range"} & set(dr_params)
+    if pushes:
+        raise SystemExit(f"{sorted(pushes)}: pushes are set per stage by the environment kwargs push_max_vel / "
+                         "push_interval (the task defaults and STAGE_ENV_ARGS), which override these; use "
+                         "--<stage>-arg push_max_vel=0.5 or --env-arg push_interval=500")
     privileged = tuple(n for n in args.privileged if n.lower() != "none")
 
     run_dir = Path(args.run_dir)
@@ -632,9 +658,7 @@ def main():
     seed_dir.mkdir(parents=True, exist_ok=True)
     git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
                          cwd=Path(__file__).resolve().parent).stdout.strip() or "unknown"
-    config = run_dir / "config.txt"
-    if not config.exists():
-        config.write_text(
+    config_text = (
             "\n".join(
                 [f"stages={' '.join(args.stages)} alg={args.alg} history_length={args.history_length} tf32={args.tf32}",
                  f"epochs stand={args.stand_epochs} walk={args.walk_epochs} run={args.run_epochs} "
@@ -649,7 +673,12 @@ def main():
                  f"std_0={args.std_0} ent_coeff={args.ent_coeff} actor_lr={args.actor_lr} critic_lr={args.critic_lr}",
                  f"git={git}", ""]
             )
-        )
+    )
+    # One per seed, always (a reused --run-dir would otherwise keep the first
+    # run's settings), and one for the run folder if it has none yet.
+    (seed_dir / "config.txt").write_text(config_text)
+    if not (run_dir / "config.txt").exists():
+        (run_dir / "config.txt").write_text(config_text)
 
     init_path = args.init_agent
     status = "ok"

@@ -226,6 +226,7 @@ class LeggedRandomizer:
             stiffness=v["jnt_stiffness"][0, self._jnts].clone(),
             joint_nominal_pos=default_joint_pos.to(dev).clone(),
             action_scale=float(action_scale),
+            total_mass=v["body_mass"][0].sum().clone(),
         )
         if not torch.allclose(v["actuator_gainprm"][0, self._act, 0], -v["actuator_biasprm"][0, self._act, 1]):
             raise ValueError("actuators are not position servos (gainprm[0] != -biasprm[1])")
@@ -312,7 +313,8 @@ class LeggedRandomizer:
         v["body_subtreemass"][idx.unsqueeze(1), self._trunk_ancestors.unsqueeze(0)] = (
             self._default["subtreemass"][self._trunk_ancestors].unsqueeze(0) + delta.unsqueeze(1)
         )
-        self._seen["mass"][idx] = v["body_mass"][idx].sum(dim=1)
+        # The seen mass is the drawn one; the unseen factor stays hidden.
+        self._seen["mass"][idx] = self._default["total_mass"] - self._default["trunk_mass"] + mass
 
         com = self._default["trunk_com"] + _uniform(p["add_com_displacement"], (n, 3), dev)
         v["body_ipos"][idx, self._trunk] = com * self._noise_factor(n, "trunk_com_factor")
@@ -404,7 +406,7 @@ class LeggedRandomizer:
         v["dof_frictionloss"][:, self._dofs] = d["frictionloss"]
         v["jnt_stiffness"][:, self._jnts] = d["stiffness"]
 
-        self._seen["mass"][:] = v["body_mass"][0].sum()
+        self._seen["mass"][:] = d["total_mass"]
         self._seen["p_gain"][:] = d["kp"]
         self._seen["d_gain"][:] = d["kd"]
         self._seen["torque_limit"][:] = d["forcerange"][:, 1]

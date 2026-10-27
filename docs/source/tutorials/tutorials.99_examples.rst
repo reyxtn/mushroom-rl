@@ -84,8 +84,8 @@ MuJoCo Environments
 Continuous Control From Pixels
 ------------------------------
 
-- `Walker (Stand Task) from Pixel <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/dm_control/walker_stand_ddpg.py>`_
-- `Walker (Stand Task) from Pixel and Shared Network <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/dm_control/walker_stand_ddpg_shared_net.py>`_
+- `Walker (Stand Task) from Pixel <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/dm_control/walker_stand_td3.py>`_
+- `Walker (Stand Task) from Pixel and Shared Network <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/dm_control/walker_stand_td3_shared_net.py>`_
 
 
 Vectorized Environments
@@ -94,9 +94,7 @@ Vectorized Environments
 - `Parallel Pendulums with Trust Region approaches <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/multiprocess_environment/gym_pendulum_trust_region.py>`_
 - `Parallel Segways with BBO <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/multiprocess_environment/segway_bbo.py>`_
 - `IsaacSim CartPole with PPO <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/isaacsim/cartpole_ppo.py>`_
-- `IsaacSim Unitree A1 with PPO <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/isaacsim/a1_rudin_ppo.py>`_
-- `IsaacSim Honey Badger with PPO <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/isaacsim/honey_badger_ppo.py>`_
-- `IsaacSim Silver Badger with PPO <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/isaacsim/silver_badger_ppo.py>`_
+- `IsaacSim quadruped locomotion with PPO <https://github.com/MushroomRL/mushroom-rl/blob/dev/examples/environments/isaacsim/quadruped_locomotion_ppo.py>`_
 
 The two ``multiprocess_environment`` scripts have a single-environment twin under ``algorithms/``, so that diffing a
 script against its twin shows what vectorization costs.

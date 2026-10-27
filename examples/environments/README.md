@@ -20,8 +20,8 @@ The DeepMind Control Suite, also installed with `pip install mushroom_rl[mujoco]
 
 | Script                                                                          | Shows                                                                                                                                               |
 |---------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
-| [`walker_stand_ddpg.py`](dm_control/walker_stand_ddpg.py)                       | the walker stand task **from pixels**, with DDPG; actor and critic each carry their own convolutional encoder                                       |
-| [`walker_stand_ddpg_shared_net.py`](dm_control/walker_stand_ddpg_shared_net.py) | the same task, with the convolutional encoder factored into a separate embedding module shared by actor and critic, which then reduce to plain MLPs |
+| [`walker_stand_td3.py`](dm_control/walker_stand_td3.py)                         | the walker stand task **from pixels**, with TD3; actor and critic each carry their own convolutional encoder                                        |
+| [`walker_stand_td3_shared_net.py`](dm_control/walker_stand_td3_shared_net.py)   | the same task, with one convolutional encoder shared by actor and critic and trained by the critic alone, plus random shift augmentation                |
 
 Together they are the reference for learning from images, and show the two ways of arranging the encoder.
 
@@ -51,12 +51,10 @@ and nothing else.
 `IsaacSim` is natively batched: a single GPU simulation advances thousands of environments at once, rather than running
 many processes. Used here for legged locomotion and a cartpole.
 
-| Script                                                  | Environment                    |
-|---------------------------------------------------------|--------------------------------|
-| [`cartpole_ppo.py`](isaacsim/cartpole_ppo.py)           | 64 cartpoles, PPO              |
-| [`a1_rudin_ppo.py`](isaacsim/a1_rudin_ppo.py)           | 4096 Unitree A1 robots, PPO    |
-| [`honey_badger_ppo.py`](isaacsim/honey_badger_ppo.py)   | 4096 Honey Badger robots, PPO  |
-| [`silver_badger_ppo.py`](isaacsim/silver_badger_ppo.py) | 4096 Silver Badger robots, PPO |
+| Script                                                                | Environment                                                      |
+|-----------------------------------------------------------------------|------------------------------------------------------------------|
+| [`cartpole_ppo.py`](isaacsim/cartpole_ppo.py)                         | 64 cartpoles, PPO                                                |
+| [`quadruped_locomotion_ppo.py`](isaacsim/quadruped_locomotion_ppo.py) | 4096 quadrupeds, PPO — `--robot {a1,honey_badger,silver_badger}` |
 
 These need NVIDIA Isaac Sim, which is a large install and requires a capable GPU. Follow the
 [Isaac Sim installation guide](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/index.html).

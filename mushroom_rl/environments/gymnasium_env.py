@@ -87,7 +87,11 @@ class Gymnasium(Environment):
         else:
             _, info = self.env.reset(seed=self._seed)
             self._seed = None
-            self.env.state = state
+
+            if not self._can_set_state:
+                raise NotImplementedError(f'{self._env_name} does not expose the observation as its state, it '
+                                          f'cannot be reset to a given state.')
+            self.env.unwrapped.state = state
 
             return np.atleast_1d(state).copy(), info
 
@@ -98,30 +102,23 @@ class Gymnasium(Environment):
         return np.atleast_1d(obs).copy(), reward, absorbing, info
 
     def render(self, record=False):
+        img = self.env.render()
+
         if self._first:
-            img = self.env.render()
+            self._viewer = ImageViewer((img.shape[1], img.shape[0]), self.info.dt, headless=self._headless)
 
-            if self._first:
-                self._viewer = ImageViewer((img.shape[1], img.shape[0]), self.info.dt, headless=self._headless)
+        self._viewer.display(img)
 
-            self._viewer.display(img)
+        self._first = False
 
-            self._first = False
-
-            if record:
-                return img
-            else:
-                return None
-
+        if record:
+            return img
         return None
 
     def stop(self):
-        try:
-            self.env.close()
-            if self._viewer is not None:
-                self._viewer.close()
-        except:
-            pass
+        self.env.close()
+        if self._viewer is not None:
+            self._viewer.close()
 
     @staticmethod
     def _set_horizon(env, horizon):
@@ -153,3 +150,9 @@ class Gymnasium(Environment):
             return Box(low=space.low, high=space.high, shape=space.shape)
         else:
             raise ValueError
+
+    @property
+    def _can_set_state(self):
+        unwrapped = self.env.unwrapped
+
+        return hasattr(unwrapped, 'state') and np.shape(unwrapped.state) == self.env.observation_space.shape

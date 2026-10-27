@@ -97,6 +97,7 @@ class DDPG(DeepAC):
         self._replay_memory.add(dataset)
         if self._replay_memory.initialized:
             state, action, reward, next_state, absorbing, *_ = self._replay_memory.get(self._batch_size())
+            state, next_state = self._augment(state), self._augment(next_state)
 
             q_next = self._next_q(next_state, absorbing)
             q = reward + self.mdp_info.gamma * q_next
@@ -146,4 +147,4 @@ class DDPG(DeepAC):
 
     def _post_load(self):
         self._actor_approximator = self.policy._approximator
-        self._update_optimizer_parameters(self._actor_approximator.parameters())
+        self.overwrite_actor_parameters(self._actor_approximator.parameters())

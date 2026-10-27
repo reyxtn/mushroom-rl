@@ -1,11 +1,12 @@
-import cv2
+import av
 import json
 import logging
 import numpy as np
+import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from pathlib import Path
-from pytest import importorskip, raises, warns
+from pytest import fixture, importorskip, raises, warns
 from mushroom_rl.algorithms.value import QLearning
 from mushroom_rl.core import Logger
 from mushroom_rl.core.dataset import Dataset
@@ -20,20 +21,23 @@ def release_logger_name(log_id):
 
 
 def read_frame_values(path):
-    capture = cv2.VideoCapture(str(path))
-    values = list()
+    with av.open(str(path)) as container:
+        return [frame.to_ndarray(format='bgr24').mean() for frame in container.decode(video=0)]
 
-    while True:
-        read, frame = capture.read()
 
-        if not read:
-            break
+@fixture(autouse=True)
+def wandb_teardown():
+    yield
 
-        values.append(frame.mean())
+    # wandb.finish() leaves a background thread alive: forking a multi-threaded process in later tests
+    # (e.g. MultiprocessEnvironment) can deadlock the child
+    try:
+        import wandb
+    except ImportError:
+        wandb = None
 
-    capture.release()
-
-    return values
+    if wandb is not None:
+        wandb.teardown()
 
 
 def test_logger(tmpdir):
@@ -194,6 +198,31 @@ def test_wandb_offline(tmpdir):
 
     logger.finish()
     assert not logger.wandb_active
+
+
+def test_wandb_vector(tmpdir):
+    importorskip('wandb')
+
+    wandb_kwargs = Logger.default_wandb_kwargs('test_project', mode='offline', dir=str(tmpdir))
+    logger = Logger('test_wandb_vector', results_dir=None, wandb_kwargs=wandb_kwargs)
+
+    logger.log_training('policy', std=np.array([0.3, 0.5]), mean=torch.tensor([1., 2., 3.]), scalar=np.array(4.),
+                        small=np.arange(31.), large=np.arange(32.))
+
+    summary = logger._wandb_run.summary
+    keys = set(summary.keys())
+
+    assert summary['training/policy/std/0'] == 0.3
+    assert summary['training/policy/std/1'] == 0.5
+    assert 'training/policy/std' not in keys
+    assert [summary[f'training/policy/mean/{i}'] for i in range(3)] == [1., 2., 3.]
+    assert summary['training/policy/scalar'] == 4.
+    assert [summary[f'training/policy/small/{i}'] for i in range(31)] == list(range(31))
+    assert 'training/policy/small' not in keys
+    assert summary['training/policy/large']['_type'] == 'histogram'
+    assert not any(key.startswith('training/policy/large/') for key in keys)
+
+    logger.finish()
 
 
 def test_wandb_group_auto_set(tmpdir):

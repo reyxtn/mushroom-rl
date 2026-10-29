@@ -231,7 +231,7 @@ class Randomizer:
     def max_delay_steps(self):
         """``max_delay`` in intermediate steps. Read from the params on every
         call, so a curriculum changing ``max_delay`` takes effect."""
-        return int(round(self._params["max_delay"] / self._step_dt))
+        return int(self._params["max_delay"] / self._step_dt + 0.5)
 
     def resample_startup(self, env_indices):
         """

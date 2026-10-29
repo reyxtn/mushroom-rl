@@ -221,7 +221,7 @@ class Go2Base(MuJoCoWarp):
 
     def _build_randomizer(self, m, act_jids):
         self._step_dt = m.opt.timestep * self._n_substeps
-        self._max_delay_steps_limit = int(round(self._max_delay_limit / self._step_dt))
+        self._max_delay_steps_limit = int(self._max_delay_limit / self._step_dt + 0.5)
         dev = self._device
         trunk = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, ROOT_BODY)
         ancestors = []
@@ -311,7 +311,7 @@ class Go2Base(MuJoCoWarp):
 
     @max_delay.setter
     def max_delay(self, value):
-        steps = int(round(value / self._step_dt))
+        steps = int(value / self._step_dt + 0.5)
         if steps > self._max_delay_steps_limit:
             raise ValueError(
                 f"max_delay {value} s exceeds max_delay_limit {self._max_delay_limit} s"

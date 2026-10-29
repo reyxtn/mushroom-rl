@@ -271,3 +271,326 @@ class Go2Base(MuJoCoWarp):
 
         if self._domain_randomization:
             self._randomizer.resample_startup(self._all_envs)
+
+    @property
+    def randomizer(self):
+        return self._randomizer
+
+    @property
+    def domain_randomization(self):
+        return self._domain_randomization
+
+    def set_domain_randomization(self, enabled):
+        """
+        Enable or disable the domain randomisation of every world.
+        """
+        self._domain_randomization = bool(enabled)
+        if enabled:
+            self._randomizer.resample_startup(self._all_envs)
+        else:
+            self._randomizer.reset_to_nominal()
+
+    @property
+    def max_delay_steps_limit(self):
+        """
+        The number of intermediate steps the action history was sized for;
+        ``max_delay_steps`` cannot be raised above it.
+
+        """
+        return self._max_delay_steps_limit
+
+    @property
+    def max_delay_steps(self):
+        """
+        Largest number of intermediate steps an action can currently be
+        delayed by.
+        """
+        return self._randomizer.max_delay_steps
+
+    @property
+    def max_delay(self):
+        """Largest delay an action can currently get, in seconds."""
+        return self._randomizer.params["max_delay"]
+
+    @max_delay.setter
+    def max_delay(self, value):
+        steps = int(round(value / self._step_dt))
+        if steps > self._max_delay_steps_limit:
+            raise ValueError(
+                f"max_delay {value} s exceeds max_delay_limit {self._max_delay_limit} s"
+            )
+        self._randomizer.params["max_delay"] = value
+
+    def randomization_obs_spec(self):
+        """
+        Length and (low, high) bounds, after scaling, of every observation in
+        RANDOMIZATION_OBS. The task class uses this to register the ones in
+        ``observed_randomization``.
+
+        """
+        n = self._n_joints
+        p = self._randomizer.params
+        kp_lo, kp_hi = p["p_gain_scale"]
+        kd_lo, kd_hi = p["d_gain_scale"]
+        tq = p["torque_limit_factor"]
+        m_lo, m_hi = p["add_trunk_mass"]
+        total = float(self._model.body_subtreemass[0])
+        return {
+            "actual_delay": (1, 0.0, 1.0),
+            "joint_calib_offset": (n, -1.0, 1.0),
+            "p_gain": (n, kp_lo, kp_hi),
+            "d_gain": (n, kd_lo, kd_hi),
+            "mass": (1, (total + m_lo) / total, (total + m_hi) / total),
+            "torque_limit": (n, 1.0 - tq, 1.0 + tq),
+            "action_scaling_factor": (n, -1.0, 1.0),
+            "joint_nominal_offset": (n, -1.0, 1.0),
+        }
+
+    def randomization_obs_value(self, name):
+        """
+        Current value of a randomized quantity for every world, (W, length),
+        scaled to O(1): ratios to the nominal value for gains, mass and
+        torque limits; offsets divided by their half-width for the encoder
+        offset, the action scale and the nominal position; the delay as a
+        fraction of the largest delay the environment was built with.
+
+        """
+        r = self._randomizer
+        d = r.default_parameters
+        p = self._randomizer.params
+        c = self._ctrl_idx
+        if name == "actual_delay":
+            return r.delay_steps.unsqueeze(1).float() / max(
+                self._max_delay_steps_limit, 1
+            )
+        if name == "joint_calib_offset":
+            return r.position_offset[:, c] / max(float(p["position_offset"]), 1e-3)
+        if name == "p_gain":
+            return r.seen_parameters["p_gain"][:, c] / d["kp"][c]
+        if name == "d_gain":
+            return r.seen_parameters["d_gain"][:, c] / d["kd"][c]
+        if name == "mass":
+            return (
+                r.seen_parameters["mass"] / float(self._model.body_subtreemass[0])
+            ).unsqueeze(1)
+        if name == "torque_limit":
+            return r.seen_parameters["torque_limit"][:, c] / d["forcerange"][c, 1]
+        if name == "action_scaling_factor":
+            lo, hi = p["add_scaling_factor"]
+            return (r.scaling_factor - d["action_scale"]) / max(abs(lo), abs(hi), 1e-3)
+        if name == "joint_nominal_offset":
+            lo, hi = p["add_joint_nominal_position"]
+            return (r.joint_nominal_pos[:, c] - d["joint_nominal_pos"][c]) / max(
+                abs(lo), abs(hi), 1e-3
+            )
+        raise ValueError(f"unknown randomized observation {name!r}")
+
+    # ------------------------------------------------------------------
+    # Action mapping
+    # ------------------------------------------------------------------
+
+    def _preprocess_action(self, action):
+        """
+        Map the policy action (W, 12) to position targets (W, 12), once per
+        policy step: the (randomized) nominal angle plus the action times the
+        (randomized) scale, shifted by the encoder miscalibration, so that
+        the controller, like the policy (see the task's _modify_observation),
+        works in coordinates offset from the truth by that much.
+
+        """
+        action = torch.as_tensor(action, dtype=torch.float32, device=self._device)
+        action = torch.clamp(action, min=-100.0, max=100.0)
+        self._actions[:] = action
+        r = self._randomizer
+        target = r.joint_nominal_pos + r.position_offset + r.scaling_factor * action
+        return torch.clamp(target, self._ctrl_lower, self._ctrl_upper)
+
+    def _compute_action(self, obs, action):
+        """
+        Called at every intermediate step: returns the target the actuators
+        see, which is the one computed ``delay`` intermediate steps ago.
+
+        The history is a ring buffer with one slot per intermediate step.
+        With the randomisation off every delay is zero and the current
+        target is returned, so the structure costs nothing but one gather.
+
+        """
+        L = self._action_history.shape[0]
+        self._history_head = (self._history_head + 1) % L
+        self._action_history[self._history_head] = action
+        if not self._domain_randomization:
+            return action
+        delay = self._randomizer.sample_latency()
+        slot = (self._history_head - delay) % L
+        return self._action_history[slot, self._all_envs]
+
+    def _set_ctrl(self, ctrl_action, env_mask):
+        """
+        Write the control of the active worlds without a host sync. The base
+        class gathers the active indices with torch.nonzero, which waits for
+        the GPU. The actuation spec covers every actuator in order (checked
+        in _modify_mdp_info), so a masked copy of the whole row is
+        equivalent.
+
+        """
+        ctrl = wp.to_torch(self._data_wp.ctrl)
+        ctrl.copy_(torch.where(env_mask.unsqueeze(1), ctrl_action.to(ctrl.dtype), ctrl))
+
+    # ------------------------------------------------------------------
+    # Quaternion helpers (w, x, y, z), batched over environments
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quat_rotate(q, v):
+        w, xyz = q[:, :1], q[:, 1:]
+        c = torch.cross(xyz, v, dim=-1)
+        return v + 2.0 * w * c + 2.0 * torch.cross(xyz, c, dim=-1)
+
+    @staticmethod
+    def _quat_rotate_inverse(q, v):
+        w, xyz = q[:, :1], q[:, 1:]
+        c = torch.cross(xyz, v, dim=-1)
+        return v - 2.0 * w * c + 2.0 * torch.cross(xyz, c, dim=-1)
+
+    @staticmethod
+    def _wrap_to_pi(angles):
+        return torch.atan2(torch.sin(angles), torch.cos(angles))
+
+    # ------------------------------------------------------------------
+    # Robot state helpers
+    # ------------------------------------------------------------------
+
+    def _projected_gravity(self):
+        """
+        Gravity direction expressed in the base frame. (num_envs, 3)
+        """
+        quat = self._read_data("base_rot")
+        g = torch.tensor([0.0, 0.0, -1.0], device=self._device).expand(quat.shape[0], 3)
+        return self._quat_rotate_inverse(quat, g)
+
+    def _heading(self):
+        """
+        Yaw angle of the base forward axis, in radians. (num_envs,)
+        """
+        quat = self._read_data("base_rot")
+        fwd = torch.tensor([1.0, 0.0, 0.0], device=self._device).expand(
+            quat.shape[0], 3
+        )
+        fwd = self._quat_rotate(quat, fwd)
+        return torch.atan2(fwd[:, 1], fwd[:, 0])
+
+    def _joint_pos(self):
+        return wp.to_torch(self._data_wp.qpos)[:, self._qpos_idx]
+
+    def _joint_vel(self):
+        return wp.to_torch(self._data_wp.qvel)[:, self._dof_idx]
+
+    def _joint_torque(self):
+        return wp.to_torch(self._data_wp.qfrc_actuator)[:, self._dof_idx]
+
+    def _foot_height(self):
+        """
+        Height of each foot geom centre above the ground. (num_envs, 4)
+        """
+        return wp.to_torch(self._data_wp.geom_xpos)[:, self._feet_geom_ids, 2]
+
+    # ------------------------------------------------------------------
+    # Health / termination
+    # ------------------------------------------------------------------
+
+    def _is_finite(self, obs):
+        qpos = wp.to_torch(self._data_wp.qpos)
+        qvel = wp.to_torch(self._data_wp.qvel)
+        return torch.isfinite(torch.cat([qpos, qvel], dim=1)).all(dim=1)
+
+    def _is_within_z_range(self, obs):
+        min_z, max_z = self._healthy_z_range
+        z = self._read_data("base_pos")[:, 2]
+        return (z >= min_z) & (z <= max_z)
+
+    def _is_upright(self, obs):
+        return self._projected_gravity()[:, 2] <= self._healthy_gravity_z
+
+    def _is_healthy(self, obs):
+        return (
+            self._is_finite(obs) & self._is_within_z_range(obs) & self._is_upright(obs)
+        )
+
+    # ------------------------------------------------------------------
+    # Reset and domain randomisation
+    # ------------------------------------------------------------------
+
+    def setup(self, env_indices, obs):
+        """
+        Reset the given worlds to the standing keyframe. With the
+        randomisation on, the episode's parameters are redrawn, the yaw and
+        the joints get uniform noise and the base a random planar velocity.
+        """
+        super().setup(env_indices, obs)
+
+        qpos = wp.to_torch(self._data_wp.qpos)
+        qvel = wp.to_torch(self._data_wp.qvel)
+        idx = (
+            env_indices.to(qpos.device).long()
+            if isinstance(env_indices, torch.Tensor)
+            else torch.as_tensor(env_indices, device=qpos.device, dtype=torch.long)
+        )
+        n = len(idx)
+        if n == 0:
+            self._mj_warp.forward(self._model_wp, self._data_wp)
+            return
+
+        qpos[idx] = self._default_qpos
+        qvel[idx] = 0.0
+
+        if self._domain_randomization:
+            p = self._randomizer.params
+            self._randomizer.resample_reset(idx)
+
+            yaw = (torch.rand(n, device=qpos.device) * 2 - 1) * p["reset_yaw_range"]
+            quat = torch.zeros(n, 4, device=qpos.device)
+            quat[:, 0] = torch.cos(0.5 * yaw)
+            quat[:, 3] = torch.sin(0.5 * yaw)
+            qpos[idx, 3:7] = quat
+
+            noise = (torch.rand(n, self._n_joints, device=qpos.device) * 2 - 1) * p[
+                "reset_joint_noise"
+            ]
+            qpos[idx.unsqueeze(1), self._qpos_idx.unsqueeze(0)] = (
+                self._default_joint_pos + noise
+            )
+            qvel[idx, 0:2] = (torch.rand(n, 2, device=qpos.device) * 2 - 1) * p[
+                "reset_base_velocity"
+            ]
+
+        # Flush the latency buffer of the reset worlds with their nominal
+        # target, so a delayed read cannot return the previous episode.
+        r = self._randomizer
+        self._action_history[:, idx] = (r.joint_nominal_pos + r.position_offset)[idx]
+
+        self._actions[idx] = 0.0
+        self._episode_length[idx] = 0
+
+        self._mj_warp.forward(self._model_wp, self._data_wp)
+
+    def _step_finalize(self):
+        self._episode_length += 1
+        if self._domain_randomization:
+            push_idx, vel = self._randomizer.sample_disturbance(
+                self._episode_length, self.dt
+            )
+            self._push_robots(push_idx, vel)
+
+    def _push_robots(self, env_indices, velocities):
+        """
+        Overwrite the base planar velocity of the given worlds.
+        """
+        if len(env_indices) == 0:
+            return
+        qvel = wp.to_torch(self._data_wp.qvel)
+        qvel[env_indices, 0:2] = velocities
+
+    def get_states(self):
+        qpos = wp.to_torch(self._data_wp.qpos)
+        qvel = wp.to_torch(self._data_wp.qvel)
+        return torch.cat([qpos, qvel], dim=1)

@@ -8,12 +8,12 @@ import math
 
 import torch
 
-from utils import _uniform, _bernoulli
+from .utils import uniform, bernoulli
 
 
 class RandomizationParams:
     """
-    Domain randomization parameters for legged robots. Inspired from the `new_isaac` branch.
+    Domain randomization parameters for legged robots. Inspired by the `new_isaac` branch.
     """
 
     def __init__(self, **overrides):
@@ -45,10 +45,12 @@ class RandomizationParams:
             push_min_episode_length=50,
             push_max_velocity=1.0,
             ground_friction_factor=5.0 / 9.0,
-            max_delay_steps=4,
+            # Seconds. Converted to intermediate steps by the Randomizer.
+            max_delay=0.02,
             mixed_chance=0.0,
             reset_yaw_range=math.pi,
-            reset_joint_noise=0.05,
+            # 0.1 matches go2_ppo.py; Davide's Isaac value is 0.05.
+            reset_joint_noise=0.1,
             reset_base_velocity=0.2,
             add_trunk_mass=(-2.0, 4.0),
             add_com_displacement=(-0.05, 0.05),
@@ -59,7 +61,10 @@ class RandomizationParams:
             add_joint_nominal_position=(0.0, 0.0),
             stay_at_default_percentage=1.0,
             joint_damping=(0.0, 0.3),
-            joint_stiffness=(0.0, 0.5),
+            # Absolute range, not a scale: a nonzero spring pulls every joint
+            # toward q = 0, not toward the nominal pose. Keep (0, 0) unless
+            # the joint zero is the nominal pose.
+            joint_stiffness=(0.0, 0.0),
             joint_armature=(0.009, 0.023),
             joint_friction_factor=0.0,
             trunk_mass_factor=0.0,
@@ -78,7 +83,9 @@ class Randomizer:
     """
     Domain randomization for legged robots. Inspired by the `new_isaac` branch.
 
-    Samples randomized parameters of every world and writes them into the per-woprld model arrays and into pytorch.
+    Samples randomized parameters of every world and writes them into the
+    per-world model arrays and into pytorch.
+
     Args:
         n_envs (int): number of worlds;
         views (dict): torch views of the batched model arrays, keyed by the
@@ -99,16 +106,30 @@ class Randomizer:
         default_joint_pos (torch.Tensor): nominal angle of every actuator's
             joint, (nu,);
         action_scale (float): nominal action scaling;
+        step_dt (float): duration of one intermediate step, in seconds. Used
+            to convert ``max_delay`` into steps;
         params (RandomizationParams, None): the ranges.
 
     """
 
     def __init__(
-        self, n_envs, views, layout, default_joint_pos, action_scale, params=None
+        self,
+        n_envs,
+        views,
+        layout,
+        default_joint_pos,
+        action_scale,
+        step_dt,
+        params=None,
     ):
         self._n_envs = n_envs
         self._views = views
-        self._params = RandomizationParams() if params is None else params
+        if params is None:
+            params = RandomizationParams()
+        elif isinstance(params, dict):
+            params = RandomizationParams(**params)
+        self._params = params
+        self._step_dt = float(step_dt)
         dev = views["body_mass"].device
         self._device = dev
 
@@ -174,42 +195,43 @@ class Randomizer:
         )
         self._mixed = torch.zeros(n_envs, dtype=torch.bool, device=dev)
         self._n_delay_steps = torch.zeros(n_envs, dtype=torch.long, device=dev)
-        # Interval mode: start every world's push timer at a random phase, so
-        # a world that is never reset is not pushed on its first eligible step.
-        interval = self._params["push_interval_range"]
-        self._time_to_push = (
-            _uniform(interval, (n_envs,), dev)
-            if interval is not None
-            else torch.zeros(n_envs, device=dev)
-        )
+        self._time_to_push = torch.zeros(n_envs, device=dev)
+        self._randomize_push_phase()
 
-        @property
-        def params(self):
-            return self._params
-        @property
-        def seen_parameters(self):
-            return self._seen
-        @property 
-        def default_parameters(self):
-            return self._default
-        @property 
-         def position_offset(self):
-        """
-        Encoder miscalibration of every actuator's joint, (W, nu).
-        """
+    @property
+    def params(self):
+        return self._params
+
+    @property
+    def seen_parameters(self):
+        return self._seen
+
+    @property
+    def default_parameters(self):
+        return self._default
+
+    @property
+    def position_offset(self):
+        """Encoder miscalibration of every actuator's joint, (W, nu)."""
         return self._unseen["position_offset"]
 
-        @property
-        def joint_nominal_pos(self):
-            return self._seen["joint_nominal_position"]
+    @property
+    def joint_nominal_pos(self):
+        return self._seen["joint_nominal_position"]
 
-        @property
-        def scaling_factor(self):
-            return self._seen["action_scaling_factor"]
+    @property
+    def scaling_factor(self):
+        return self._seen["action_scaling_factor"]
 
-        @property
-        def delay_steps(self):
-            return self._n_delay_steps
+    @property
+    def delay_steps(self):
+        return self._n_delay_steps
+
+    @property
+    def max_delay_steps(self):
+        """``max_delay`` in intermediate steps. Read from the params on every
+        call, so a curriculum changing ``max_delay`` takes effect."""
+        return int(round(self._params["max_delay"] / self._step_dt))
 
     def resample_startup(self, env_indices):
         """
@@ -225,25 +247,38 @@ class Randomizer:
         p = self._params
 
         # Trunk mass and inertia. The inertia scales with the mass, as in Isaac.
-        mass = self._default["trunk_mass"] + _uniform(p["add_trunk_mass"], (n,), dev)
+        mass = self._default["trunk_mass"] + uniform(p["add_trunk_mass"], (n,), dev)
         unseen_mass = mass * self._noise_factor(n, "trunk_mass_factor").squeeze(1)
         ratio = unseen_mass / self._default["trunk_mass"]
         v = self._views
         v["body_mass"][idx, self._trunk] = unseen_mass
-        v["body_inertia"][idx, self._trunk] = self._default["trunk_inertia"] * ratio.unsqueeze(1)
+        v["body_inertia"][idx, self._trunk] = self._default[
+            "trunk_inertia"
+        ] * ratio.unsqueeze(1)
         delta = unseen_mass - self._default["trunk_mass"]
         v["body_subtreemass"][idx.unsqueeze(1), self._trunk_ancestors.unsqueeze(0)] = (
-            self._default["subtreemass"][self._trunk_ancestors].unsqueeze(0) + delta.unsqueeze(1)
+            self._default["subtreemass"][self._trunk_ancestors].unsqueeze(0)
+            + delta.unsqueeze(1)
         )
         # The seen mass is the drawn one; the unseen factor stays hidden.
-        self._seen["mass"][idx] = self._default["total_mass"] - self._default["trunk_mass"] + mass
+        self._seen["mass"][idx] = (
+            self._default["total_mass"] - self._default["trunk_mass"] + mass
+        )
 
-        com = self._default["trunk_com"] + _uniform(p["add_com_displacement"], (n, 3), dev)
-        v["body_ipos"][idx, self._trunk] = com * self._noise_factor(n, "trunk_com_factor")
+        com = self._default["trunk_com"] + uniform(
+            p["add_com_displacement"], (n, 3), dev
+        )
+        v["body_ipos"][idx, self._trunk] = com * self._noise_factor(
+            n, "trunk_com_factor"
+        )
 
         # Gains: seen scale, unseen noise on top.
-        self._seen["p_gain"][idx] = self._default["kp"] * _uniform(p["p_gain_scale"], (n, self._nu), dev)
-        self._seen["d_gain"][idx] = self._default["kd"] * _uniform(p["d_gain_scale"], (n, self._nu), dev)
+        self._seen["p_gain"][idx] = self._default["kp"] * uniform(
+            p["p_gain_scale"], (n, self._nu), dev
+        )
+        self._seen["d_gain"][idx] = self._default["kd"] * uniform(
+            p["d_gain_scale"], (n, self._nu), dev
+        )
         self._unseen["p_gain"][idx] = self._noise_factor(n, "p_gain_factor")
         self._unseen["d_gain"][idx] = self._noise_factor(n, "d_gain_factor")
         self._write_gains(idx)
@@ -266,52 +301,62 @@ class Randomizer:
 
         # Joint dynamics: absolute range with probability (1 - stay), nominal
         # otherwise, then unseen noise.
-        stay = _bernoulli(p["stay_at_default_percentage"], n, dev)
+        stay = bernoulli(p["stay_at_default_percentage"], n, dev)
         for name, nominal_key, field, sel in (
             ("joint_damping", "damping", "dof_damping", self._dofs),
             ("joint_armature", "armature", "dof_armature", self._dofs),
             ("joint_stiffness", "stiffness", "jnt_stiffness", self._jnts),
         ):
             nominal = self._default[nominal_key]
-            drawn = _uniform(p[name], (n, nu), dev)
+            drawn = uniform(p[name], (n, nu), dev)
             seen = torch.where(stay.unsqueeze(1), nominal.expand(n, nu), drawn)
-            v[field][idx.unsqueeze(1), sel.unsqueeze(0)] = seen * self._noise_factor(n, f"{name}_factor")
+            v[field][idx.unsqueeze(1), sel.unsqueeze(0)] = seen * self._noise_factor(
+                n, f"{name}_factor"
+            )
 
         hw = p["joint_friction_factor"]
         v["dof_frictionloss"][idx.unsqueeze(1), self._dofs.unsqueeze(0)] = (
-            self._default["frictionloss"] * (1.0 + _uniform((-hw, hw), (n, nu), dev))
+            self._default["frictionloss"] * (1.0 + uniform((-hw, hw), (n, nu), dev))
         )
 
         hw = p["torque_limit_factor"]
-        limit = self._default["forcerange"][:, 1] * (1.0 + _uniform((-hw, hw), (n, nu), dev))
+        limit = self._default["forcerange"][:, 1] * (
+            1.0 + uniform((-hw, hw), (n, nu), dev)
+        )
         self._seen["torque_limit"][idx] = limit
         v["actuator_forcerange"][idx.unsqueeze(1), self._act.unsqueeze(0), 0] = -limit
         v["actuator_forcerange"][idx.unsqueeze(1), self._act.unsqueeze(0), 1] = limit
 
         # Actuation seen by the control law.
-        self._seen["action_scaling_factor"][idx] = self._default["action_scale"] + _uniform(
-            p["add_scaling_factor"], (n, nc), dev
-        )
-        self._seen["joint_nominal_position"][idx] = self._default["joint_nominal_pos"] + _uniform(
-            p["add_joint_nominal_position"], (n, nu), dev
-        )
+        self._seen["action_scaling_factor"][idx] = self._default[
+            "action_scale"
+        ] + uniform(p["add_scaling_factor"], (n, nc), dev)
+        self._seen["joint_nominal_position"][idx] = self._default[
+            "joint_nominal_pos"
+        ] + uniform(p["add_joint_nominal_position"], (n, nu), dev)
         hw = p["position_offset"]
-        self._unseen["position_offset"][idx] = _uniform((-hw, hw), (n, nu), dev)
-        self._unseen["motor_strength"][idx] = self._noise_factor(n, "motor_strength_factor")
+        self._unseen["position_offset"][idx] = uniform((-hw, hw), (n, nu), dev)
+        self._unseen["motor_strength"][idx] = self._noise_factor(
+            n, "motor_strength_factor"
+        )
         self._write_gains(idx)
 
         # Latency regime.
-        self._mixed[idx] = _bernoulli(p["mixed_chance"], n, dev)
-        self._n_delay_steps[idx] = torch.randint(0, int(p["max_delay_steps"]) + 1, (n,), device=dev)
+        self._mixed[idx] = bernoulli(p["mixed_chance"], n, dev)
+        self._n_delay_steps[idx] = torch.randint(
+            0, self.max_delay_steps + 1, (n,), device=dev
+        )
 
         # Ground friction: one factor per world, on the foot geoms, whose
         # priority makes them win every foot-floor contact.
         hw = p["ground_friction_factor"]
-        factor = 1.0 + _uniform((-hw, hw), (n, 1), dev)
-        v["geom_friction"][idx.unsqueeze(1), self._feet.unsqueeze(0), 0] = self._default["foot_friction"] * factor
+        factor = 1.0 + uniform((-hw, hw), (n, 1), dev)
+        v["geom_friction"][idx.unsqueeze(1), self._feet.unsqueeze(0), 0] = (
+            self._default["foot_friction"] * factor
+        )
 
         if p["push_interval_range"] is not None:
-            self._time_to_push[idx] = _uniform(p["push_interval_range"], (n,), dev)
+            self._time_to_push[idx] = uniform(p["push_interval_range"], (n,), dev)
 
     def reset_to_nominal(self):
         """
@@ -322,7 +367,9 @@ class Randomizer:
         v["body_mass"][:, self._trunk] = d["trunk_mass"]
         v["body_inertia"][:, self._trunk] = d["trunk_inertia"]
         v["body_ipos"][:, self._trunk] = d["trunk_com"]
-        v["body_subtreemass"][:, self._trunk_ancestors] = d["subtreemass"][self._trunk_ancestors]
+        v["body_subtreemass"][:, self._trunk_ancestors] = d["subtreemass"][
+            self._trunk_ancestors
+        ]
         v["geom_friction"][:, self._feet, 0] = d["foot_friction"]
         v["actuator_forcerange"][:, self._act] = d["forcerange"]
         v["dof_damping"][:, self._dofs] = d["damping"]
@@ -341,7 +388,7 @@ class Randomizer:
         self._unseen["position_offset"][:] = 0.0
         self._mixed[:] = False
         self._n_delay_steps[:] = 0
-        self._time_to_push[:] = 0.0
+        self._randomize_push_phase()
         self._write_gains(torch.arange(W, device=self._device))
 
     def sample_disturbance(self, episode_length, dt):
@@ -353,27 +400,29 @@ class Randomizer:
         p = self._params
         W = self._n_envs
         if p["push_interval_range"] is None:
-            do_push = _bernoulli(p["push_probability"], W, self._device)
+            do_push = bernoulli(p["push_probability"], W, self._device)
         else:
             self._time_to_push -= dt
             do_push = self._time_to_push <= 0.0
             self._time_to_push = torch.where(
-                do_push, _uniform(p["push_interval_range"], (W,), self._device), self._time_to_push
+                do_push,
+                uniform(p["push_interval_range"], (W,), self._device),
+                self._time_to_push,
             )
         do_push &= episode_length > p["push_min_episode_length"]
         idx = torch.nonzero(do_push, as_tuple=True)[0]
         vmax = p["push_max_velocity"]
-        return idx, _uniform((-vmax, vmax), (len(idx), 2), self._device)
+        return idx, uniform((-vmax, vmax), (len(idx), 2), self._device)
 
     def sample_latency(self):
-        """ 
+        """
         Delay of the next action in intermediate steps, (W,) long.
         No `.any()` test: that would be a host sync at every intermediate
         step. With mixed_chance = 0 (the default) nothing runs at all.
         """
         if self._params["mixed_chance"] > 0.0:
             redrawn = torch.randint(
-                0, int(self._params["max_delay_steps"]) + 1, (self._n_envs,), device=self._device
+                0, self.max_delay_steps + 1, (self._n_envs,), device=self._device
             )
             self._n_delay_steps = torch.where(self._mixed, redrawn, self._n_delay_steps)
         return self._n_delay_steps
@@ -382,6 +431,15 @@ class Randomizer:
     # Internals
     # ------------------------------------------------------------------
 
+    def _randomize_push_phase(self):
+        """Interval mode: start every world's push timer at a random phase, so
+        no world is pushed on its first eligible step."""
+        interval = self._params["push_interval_range"]
+        if interval is not None:
+            self._time_to_push[:] = uniform(interval, (self._n_envs,), self._device)
+        else:
+            self._time_to_push[:] = 0.0
+
     def _idx(self, env_indices):
         if isinstance(env_indices, torch.Tensor):
             return env_indices.to(self._device).long()
@@ -389,7 +447,7 @@ class Randomizer:
 
     def _noise_factor(self, n, name):
         hw = self._params[name]
-        return _uniform((1.0 - hw, 1.0 + hw), (n, 1), self._device)
+        return uniform((1.0 - hw, 1.0 + hw), (n, 1), self._device)
 
     def _write_gains(self, idx):
         """
@@ -398,8 +456,16 @@ class Randomizer:
         scales the whole force, so it multiplies all three.
 
         """
-        kp = self._seen["p_gain"][idx] * self._unseen["p_gain"][idx] * self._unseen["motor_strength"][idx]
-        kd = self._seen["d_gain"][idx] * self._unseen["d_gain"][idx] * self._unseen["motor_strength"][idx]
+        kp = (
+            self._seen["p_gain"][idx]
+            * self._unseen["p_gain"][idx]
+            * self._unseen["motor_strength"][idx]
+        )
+        kd = (
+            self._seen["d_gain"][idx]
+            * self._unseen["d_gain"][idx]
+            * self._unseen["motor_strength"][idx]
+        )
         rows = idx.unsqueeze(1)
         cols = self._act.unsqueeze(0)
         self._views["actuator_gainprm"][rows, cols, 0] = kp

@@ -17,3 +17,4 @@ logs/
 CLAUDE.md
 .claude/
 mushroom_rl/environments/mujoco_warp_envs/locomotion/unitree/data/
+runs/

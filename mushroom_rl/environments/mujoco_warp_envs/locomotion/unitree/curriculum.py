@@ -1,140 +1,94 @@
 """
-The within-stage schedule the legged training scripts tighten the task
-along: velocity command ranges, actuation latency ceiling and tracking
-tolerance, as fractions of the stage's policy updates.
+The schedule the task is tightened along, applied after every policy update.
+A port of the ``Curriculum`` of new_isaac's ``go2_curriculum.py``: same
+thresholds (counted in control steps per environment, i.e. dataset rows), same
+staged command ranges and delay ceilings, same linear interpolation of the
+tracking tolerances.
 
-Ported from the new_isaac ``go2_curriculum.py``; the environment only accepts new values,
-when to change them is decided here.
-
-Used by ``examples/environments/mujoco_warp/h2_curriculum.py`` and
-``go2_curriculum.py``.
+Two additions that do not change the schedule: the delays are given in
+seconds (Isaac counts 5 ms physics steps; the warp env converts with its own
+step length), and ``complete`` / ``state()`` for the best-checkpoint logic and
+the logs of the training script.
 
 """
 
 
 class Curriculum:
     """
-    The schedule a stage is tightened along, applied after every policy
-    update (a ``Core`` fit callback). Thresholds are fractions of the stage's
-    updates rather than step counts, so they do not depend on the epoch
-    count.
-
-    ``complete`` is True once every schedule has reached its final value.
-    The stage's best checkpoint should only be looked for from then on:
-    before, the commands are easier and the tracking kernel wider, so the
-    returns are higher for reasons that have nothing to do with the policy.
-
-    With ``enabled=False`` every schedule sits at its final value from the
-    start and ``complete`` is True throughout.
-
     Args:
-        mdp: the environment; needs the ``command_ranges``, ``tracking_sigma``
-            and ``max_delay`` setters, ``max_delay_steps``,
-            ``max_delay_steps_limit`` and ``domain_randomization``;
-        n_fits (int): policy updates in the stage;
-        command_stages (tuple): fractions at which the command ranges switch
-            to the next entry of ``command_ranges``;
-        command_ranges (list): dicts for the ``command_ranges`` setter, or
-            None to leave the ranges alone;
-        delay_stages (tuple): fractions at which the latency ceiling switches
-            to the next entry of ``delays``;
-        delays (list): latency ceilings in seconds, clamped to the
-            environment's limit;
-        sigma_window (tuple, None): fractions between which the tracking
-            sigma is interpolated from ``sigmas[0]`` to ``sigmas[1]``;
-        sigmas (tuple, None): the two ends of the sigma schedule;
-        enabled (bool, True): see above.
+        mdp (Go2Walk): the environment the schedule is applied to;
+        command_steps (list): the step counts at which the next stage
+            begins, one fewer than the stages;
+        command_ranges (list): the linear velocity command range of each
+            stage, applied to x and y;
+        delays (list): the ceiling on the actuation delay of each stage, in
+            seconds;
+        tracking_steps (tuple): the step counts the tracking tolerance is
+            interpolated between;
+        tracking_stds (tuple): the tolerances (dicts for ``mdp.tracking_stds``)
+            at the two ends of that interpolation;
+        enabled (bool, True): with False, every schedule sits at its final
+            value from the start.
 
     """
 
-    def __init__(
-        self,
-        mdp,
-        n_fits,
-        command_stages,
-        command_ranges,
-        delay_stages,
-        delays,
-        sigma_window,
-        sigmas,
-        enabled=True,
-    ):
+    def __init__(self, mdp, command_steps, command_ranges, delays, tracking_steps, tracking_stds, enabled=True):
         self._mdp = mdp
-        self._n_fits = max(int(n_fits), 1)
-        self._command_stages = tuple(command_stages)
+        self._command_steps = list(command_steps)
         self._command_ranges = list(command_ranges)
-        self._delay_stages = tuple(delay_stages)
-        # The ring buffer was sized at construction; a schedule entry above
-        # its ceiling would be refused by the max_delay setter.
-        limit = mdp.max_delay_steps_limit * mdp._step_dt
-        self._delays = [min(float(d), limit) for d in delays]
-        self._sigma_window = sigma_window
-        self._sigmas = sigmas
+        self._delays = list(delays)
+        self._tracking_steps = tuple(tracking_steps)
+        self._tracking_stds = tracking_stds
         self._enabled = enabled
-        self._fit = 0
-        thresholds = list(self._command_stages) + list(self._delay_stages)
-        if sigma_window is not None:
-            thresholds.append(sigma_window[1])
-        self._complete_at = max(thresholds) if thresholds else 0.0
+
+        self._step = 0
         self.apply()
 
     def __call__(self, dataset):
-        self._fit += 1
+        # a vectorized dataset holds one row per control step, whichever
+        # environment it came from
+        self._step += len(dataset)
         self.apply()
 
+    def apply(self):
+        low, high = self._command_ranges[self.stage]
+        self._mdp.command_generator.command_ranges = dict(lin_vel_x=(low, high), lin_vel_y=(low, high))
+        if self._mdp.domain_randomization:
+            self._mdp.max_delay = min(self._delays[self.stage], self._mdp.max_delay_limit)
+
+        start, end = self._tracking_stds
+        self._mdp.tracking_stds = {name: start[name] + self.progress * (end[name] - start[name]) for name in start}
+
     @property
-    def fraction(self):
+    def step(self):
+        return self._step
+
+    @property
+    def stage(self):
         if not self._enabled:
-            return 1.0
-        return min(self._fit / self._n_fits, 1.0)
-
-    @property
-    def complete_at(self):
-        return self._complete_at
-
-    @property
-    def complete(self):
-        return self.fraction >= self._complete_at
-
-    @property
-    def command_stage(self):
-        return sum(self.fraction >= t for t in self._command_stages)
-
-    @property
-    def delay_stage(self):
-        return sum(self.fraction >= t for t in self._delay_stages)
-
-    @property
-    def delays(self):
-        """The latency ceilings of the schedule, in seconds."""
-        return list(self._delays)
+            return len(self._command_steps)
+        return sum(self._step >= threshold for threshold in self._command_steps)
 
     @property
     def progress(self):
-        if self._sigma_window is None:
-            return 1.0
-        start, end = self._sigma_window
-        return min(max((self.fraction - start) / (end - start), 0.0), 1.0)
+        if not self._enabled:
+            return 1.
+        start, end = self._tracking_steps
+        return min(max((self._step - start) / (end - start), 0.), 1.)
 
-    def apply(self):
-        ranges = self._command_ranges[
-            min(self.command_stage, len(self._command_ranges) - 1)
-        ]
-        if ranges is not None:
-            self._mdp.command_ranges = ranges
-        if self._mdp.domain_randomization:
-            self._mdp.max_delay = self._delays[
-                min(self.delay_stage, len(self._delays) - 1)
-            ]
-        if self._sigmas is not None:
-            start, end = self._sigmas
-            self._mdp.tracking_sigma = start + self.progress * (end - start)
+    @property
+    def complete_at(self):
+        """The step count from which every schedule sits at its final value."""
+        return max(self._command_steps + [self._tracking_steps[1]])
+
+    @property
+    def complete(self):
+        return not self._enabled or self._step >= self.complete_at
 
     def state(self):
         return dict(
-            cmd_stage=self.command_stage,
-            delay_steps=self._mdp.max_delay_steps,
-            sigma=self._mdp.tracking_sigma,
+            stage=self.stage,
             progress=self.progress,
+            delay_steps=self._mdp.max_delay_steps,
             complete=float(self.complete),
         )

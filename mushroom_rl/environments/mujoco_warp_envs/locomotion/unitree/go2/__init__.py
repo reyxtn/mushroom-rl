@@ -1,3 +1,3 @@
 from .base import Go2Base
 
-# from .walk import Go2Walk
+from .walk import Go2Walk

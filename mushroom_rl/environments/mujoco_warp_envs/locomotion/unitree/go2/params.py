@@ -58,3 +58,16 @@ RANDOMIZATION_OBS = (
     "action_scaling_factor",
     "joint_nominal_offset",
 )
+
+
+REWARD_KEYS = (
+    "tracking_lin_vel",
+    "tracking_ang_vel",
+    "lin_vel_z",
+    "ang_vel_xy",
+    "torques",
+    "joint_acc",
+    "feet_air_time",
+    "action_rate",
+    "joint_pos_limits",
+)

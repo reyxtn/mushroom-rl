@@ -2,13 +2,13 @@ import mujoco
 import numpy as np
 import torch
 import warp as wp
-import mujoco_warp as mj_warp
 
 from mushroom_rl.core.spaces import Box
 from mushroom_rl.utils.mujoco import ObservationType
 from mushroom_rl.environments.mujoco_warp import MuJoCoWarp
 from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.randomizer import (
     Randomizer,
+    RandomizationParams,
 )
 
 from .fetch_go2_model import ensure_go2_model
@@ -72,8 +72,11 @@ class Go2Base(MuJoCoWarp):
             ("base_rot", ROOT_BODY, ObservationType.BODY_ROT),
         ]
         self._n_substeps = n_substeps
+        if randomization_params is None:
+            randomization_params = RandomizationParams()
+        elif isinstance(randomization_params, dict):
+            randomization_params = RandomizationParams(**randomization_params)
         self._randomization_params = randomization_params
-
         self._healthy_z_range = healthy_z_range
         self._healthy_gravity_z = healthy_gravity_z
         self._terminate_when_unhealthy = terminate_when_unhealthy
@@ -108,12 +111,6 @@ class Go2Base(MuJoCoWarp):
 
         self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.LS_ITERATIONS
         self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.ITERATIONS
-
-        self._model_wp = mj_warp.put_model(
-            self._model, batch_sizes={f: num_envs for f in BATCHED_MODEL_FIELDS}
-        )
-        self._model_wp.opt.warn_overflow &= ~mj_warp.OverflowType.LS_ITERATIONS
-        self._model_wp.opt.warn_overflow &= ~mj_warp.OverflowType.ITERATIONS
 
         self._build_randomizer(self._model, self._act_jids)
 
@@ -329,7 +326,7 @@ class Go2Base(MuJoCoWarp):
 
         """
         n = self._n_joints
-        p = self._randomizer.params
+        p = self._randomization_params
         kp_lo, kp_hi = p["p_gain_scale"]
         kd_lo, kd_hi = p["d_gain_scale"]
         tq = p["torque_limit_factor"]

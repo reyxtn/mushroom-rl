@@ -1,0 +1,29 @@
+[1793796149] llama_init_from_gpt_params: setting dry_penalty_last_n to ctx_size = 16384
+[1793796149] warming up the model with an empty run
+[1793797549] Preserved token: 248068
+[1793797549] Preserved token: 248069
+[1793797549] Preserved token: 248058
+[1793797549] Preserved token: 248059
+[1793797549] Not preserved because more than 1 token: <function=
+[1793797549] Preserved token: 29
+[1793797549] Not preserved because more than 1 token: </function>
+[1793797549] Not preserved because more than 1 token: <parameter=
+[1793797549] Not preserved because more than 1 token: </parameter>
+[1793797856] Preserved token: 248068
+[1793797856] Preserved token: 248069
+[1793797856] Preserved token: 248058
+[1793797856] Preserved token: 248059
+[1793797856] Not preserved because more than 1 token: <function=
+[1793797856] Preserved token: 29
+[1793797856] Not preserved because more than 1 token: </function>
+[1793797856] Not preserved because more than 1 token: <parameter=
+[1793797856] Not preserved because more than 1 token: </parameter>
+[1793797874] Preserved token: 248068
+[1793797874] Preserved token: 248069
+[1793797874] Preserved token: 248058
+[1793797874] Preserved token: 248059
+[1793797874] Not preserved because more than 1 token: <function=
+[1793797874] Preserved token: 29
+[1793797874] Not preserved because more than 1 token: </function>
+[1793797874] Not preserved because more than 1 token: <parameter=
+[1793797874] Not preserved because more than 1 token: </parameter>

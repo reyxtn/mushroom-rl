@@ -20,13 +20,15 @@ class Curriculum:
         command_steps (list): the step counts at which the next stage
             begins, one fewer than the stages;
         command_ranges (list): the linear velocity command range of each
-            stage, applied to x and y;
+            stage: a ``(low, high)`` tuple applied to x and y, a dict for the
+            generator's ``command_ranges`` setter, or None to leave them;
         delays (list): the ceiling on the actuation delay of each stage, in
             seconds;
         tracking_steps (tuple): the step counts the tracking tolerance is
             interpolated between;
-        tracking_stds (tuple): the tolerances (dicts for ``mdp.tracking_stds``)
-            at the two ends of that interpolation;
+        tracking_stds (tuple, None): the tolerances (dicts for
+            ``mdp.tracking_stds``) at the two ends of that interpolation, or
+            None to leave the tolerance alone;
         enabled (bool, True): with False, every schedule sits at its final
             value from the start.
 
@@ -51,13 +53,18 @@ class Curriculum:
         self.apply()
 
     def apply(self):
-        low, high = self._command_ranges[self.stage]
-        self._mdp.command_generator.command_ranges = dict(lin_vel_x=(low, high), lin_vel_y=(low, high))
+        ranges = self._command_ranges[self.stage]
+        if isinstance(ranges, (tuple, list)):
+            low, high = ranges
+            ranges = dict(lin_vel_x=(low, high), lin_vel_y=(low, high))
+        if ranges is not None:
+            self._mdp.command_generator.command_ranges = ranges
         if self._mdp.domain_randomization:
             self._mdp.max_delay = min(self._delays[self.stage], self._mdp.max_delay_limit)
 
-        start, end = self._tracking_stds
-        self._mdp.tracking_stds = {name: start[name] + self.progress * (end[name] - start[name]) for name in start}
+        if self._tracking_stds is not None:
+            start, end = self._tracking_stds
+            self._mdp.tracking_stds = {name: start[name] + self.progress * (end[name] - start[name]) for name in start}
 
     @property
     def step(self):
@@ -71,7 +78,7 @@ class Curriculum:
 
     @property
     def progress(self):
-        if not self._enabled:
+        if not self._enabled or self._tracking_stds is None:
             return 1.
         start, end = self._tracking_steps
         return min(max((self._step - start) / (end - start), 0.), 1.)
@@ -79,7 +86,10 @@ class Curriculum:
     @property
     def complete_at(self):
         """The step count from which every schedule sits at its final value."""
-        return max(self._command_steps + [self._tracking_steps[1]])
+        steps = list(self._command_steps)
+        if self._tracking_stds is not None:
+            steps.append(self._tracking_steps[1])
+        return max(steps) if steps else 0
 
     @property
     def complete(self):

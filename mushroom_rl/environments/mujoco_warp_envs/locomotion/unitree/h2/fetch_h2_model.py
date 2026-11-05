@@ -75,13 +75,15 @@ OPTION = dict(
 JOINT_DYNAMICS = dict(damping="0.05", armature="0.01", frictionloss="0.2")
 
 # Foot contact parameters.
+# group 3: collision only, hidden by the viewer (the foot meshes in group 1
+# are what gets drawn).
 FOOT_GEOM = dict(
     condim="3",
     friction="0.8 0.02 0.01",
     priority="1",
     contype="1",
     conaffinity="1",
-    group="0",
+    group="3",
 )
 
 # PD gains of the position actuators, (substring of joint name, kp, kd).

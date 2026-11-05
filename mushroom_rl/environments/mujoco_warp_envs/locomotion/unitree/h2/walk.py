@@ -276,6 +276,10 @@ class H2Walk(H2Base):
         """Worlds whose planar velocity command is non-zero."""
         return self._command_generator.commands[:, :2].norm(dim=1) > self._reward_params["moving_threshold"]
 
+    def _standing(self):
+        """Worlds whose whole command, yaw included, is zero."""
+        return self._command_generator.commands.norm(dim=1) < self._reward_params["moving_threshold"]
+
     def _desired_stance(self):
         """
         Contact schedule from the gait clock, (num_envs, 2) bool, True where
@@ -353,6 +357,7 @@ class H2Walk(H2Base):
             "feet_clearance": self._reward_feet_clearance(foot_height, contact) * w["feet_clearance"] * dt,
             "feet_distance": self._reward_feet_distance(foot_pos) * w["feet_distance"] * dt,
             "gait": self._reward_gait(contact) * w["gait"] * dt,
+            "stand_still": self._reward_stand_still(joint_pos, joint_vel) * w["stand_still"] * dt,
         }
 
         total = torch.clamp(sum(r.values()), min=0.0)
@@ -417,6 +422,12 @@ class H2Walk(H2Base):
     def _reward_gait(self, contact):
         """Fraction of feet whose contact state matches the gait schedule."""
         return (contact == self._desired_stance()).float().mean(dim=1)
+
+    def _reward_stand_still(self, joint_pos, joint_vel):
+        """Joint deviation from the default pose plus joint speed, zero command only."""
+        dev = (joint_pos - self._default_joint_pos).abs().sum(dim=1)
+        speed = joint_vel.abs().sum(dim=1) * self.dt
+        return (dev + speed) * self._standing()
 
     # ------------------------------------------------------------------
     # Termination

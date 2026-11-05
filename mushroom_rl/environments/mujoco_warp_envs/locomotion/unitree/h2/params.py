@@ -115,6 +115,7 @@ REWARD_TERMS = (
     "feet_clearance",
     "feet_distance",
     "gait",
+    "stand_still",
 )
 
 DEFAULT_REWARD_WEIGHTS = dict(
@@ -135,6 +136,7 @@ DEFAULT_REWARD_WEIGHTS = dict(
     feet_clearance=-2.0,
     feet_distance=-2.0,
     gait=0.5,
+    stand_still=-0.5,
 )
 
 DEFAULT_REWARD_PARAMS = dict(
@@ -153,6 +155,7 @@ STAND_REWARD_WEIGHTS = dict(
     feet_air_time=0.0,
     feet_clearance=0.0,
     gait=1.0,
+    stand_still=-1.0,
 )
 
 # Running changes the gait, not just the speed: a flight phase in every
@@ -185,6 +188,7 @@ WALK_COMMAND_GENERATOR = dict(
     command_resampling_time_range=None,
     heading_control_stiffness=0.5,
     rel_heading_envs=1.0,
+    rel_standing_envs=0.15,
 )
 STAND_COMMAND_GENERATOR = dict(
     WALK_COMMAND_GENERATOR,
@@ -195,6 +199,7 @@ RUN_COMMAND_GENERATOR = dict(
     WALK_COMMAND_GENERATOR,
     command_ranges=dict(lin_vel_x=(1.0, 3.0), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-1.0, 1.0)),
     command_dead_zone=0.5,
+    rel_standing_envs=0.0,
 )
 
 # Pushes of the old tasks (randomizer push_probability / push_max_velocity).

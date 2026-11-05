@@ -1,5 +1,5 @@
 """
-Trains the Unitree H2 locomotion curriculum, stand -> walk -> run, for one
+Trains the Unitree H2 locomotion curriculum, stand -> walk, for one
 seed, with domain randomization and an asymmetric actor-critic, in MuJoCo
 Warp. The go2_curriculum.py bookkeeping (seeds, eval, best checkpoint after
 the schedule completes) plus the stage chain: every stage warm-starts from
@@ -8,7 +8,7 @@ the chain.
 
     python h2_curriculum.py --seed 1
     for s in 1 2 3 4 5; do python h2_curriculum.py --seed $s --run-dir runs/h2_dr; done
-    python h2_curriculum.py --seed 1 --stages walk run --init-agent runs/h2_dr/seed_1/stand.msh
+    python h2_curriculum.py --seed 1 --stages walk --init-agent runs/h2_dr/seed_1/stand.msh
     python h2_curriculum.py --seed 1 --no-dr                      # nominal model, nothing random
     python h2_curriculum.py --seed 1 --old-dr --no-curriculum --privileged none   # the old h2_sweep.sh setup
     python h2_curriculum.py --seed 1 --dr add_trunk_mass="(-5,10)" --dr max_delay=0.01
@@ -51,7 +51,7 @@ from tqdm import trange
 
 from mushroom_rl.core import Agent, Core, Logger
 from mushroom_rl.algorithms.actor_critic import PPO, RudinPPO
-from mushroom_rl.environments.mujoco_warp_envs import H2Run, H2Stand, H2Walk
+from mushroom_rl.environments.mujoco_warp_envs import H2Stand, H2Walk
 from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.randomizer import RandomizationParams
 from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.networks import MaskedActorNetwork
 from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.curriculum import Curriculum
@@ -60,8 +60,8 @@ from mushroom_rl.policy import GaussianTorchPolicy
 from mushroom_rl.approximators.parametric.networks import ActorNetwork
 from mushroom_rl.utils.torch_utils import TorchUtils
 
-TASKS = {"stand": H2Stand, "walk": H2Walk, "run": H2Run}
-STAGES = ("stand", "walk", "run")
+TASKS = {"stand": H2Stand, "walk": H2Walk}
+STAGES = ("stand", "walk")
 
 # ----------------------------------------------------------------------
 # Defaults per stage. Everything here can be overridden from the command
@@ -69,8 +69,8 @@ STAGES = ("stand", "walk", "run")
 # --<stage>-arg KEY=VALUE, the gate with --<stage>-min-ep-len.
 # ----------------------------------------------------------------------
 
-STAGE_EPOCHS = dict(stand=80, walk=120, run=80)
-STAGE_MIN_EP_LEN = dict(stand=200.0, walk=700.0, run=0.0)
+STAGE_EPOCHS = dict(stand=80, walk=120)
+STAGE_MIN_EP_LEN = dict(stand=200.0, walk=0.0)
 
 # The dr_sweep3 recipe: survival worth less than tracking, posture and
 # stillness paid for, gentler pushes than the tasks' own. Stand keeps the
@@ -86,23 +86,14 @@ STAGE_REWARD_WEIGHTS = dict(
         ang_vel_xy=-0.3,
         action_rate=-0.03,
     ),
-    run=dict(
-        alive=0.5,
-        tracking_lin_vel=2.0,
-        tracking_ang_vel=1.0,
-        feet_slip=-1.0,
-        action_rate=-0.03,
-    ),
 )
 STAGE_REWARD_PARAMS = dict(
     stand=dict(),
     walk=dict(feet_air_time_threshold=0.25),  # below the 0.32 s scheduled swing, so following the gait clock pays
-    run=dict(),
 )
 STAGE_PUSHES = dict(
     stand=dict(push_max_velocity=0.5),  # H2Stand's 1/250 interval, gentler than its 0.8 m/s
     walk=dict(push_max_velocity=0.3),
-    run=dict(),
 )
 
 # Within-stage schedules, as fractions of the stage's steps per environment
@@ -129,18 +120,6 @@ STAGE_CURRICULUM = dict(
         delay_steps=(0.3, 0.6),
         tracking_steps=(0.1, 0.5),
         tracking_stds=(dict(sigma=0.5), dict(sigma=0.25)),
-    ),
-    run=dict(
-        command_steps=(0.3, 0.6),
-        command_ranges=[
-            dict(lin_vel_x=(1.0, 1.5), lin_vel_y=(-0.2, 0.2)),
-            dict(lin_vel_x=(1.0, 2.2), lin_vel_y=(-0.3, 0.3)),
-            dict(lin_vel_x=(1.0, 3.0), lin_vel_y=(-0.3, 0.3)),
-        ],
-        delays=[0.0, 0.01, 0.02],
-        delay_steps=(0.3, 0.6),
-        tracking_steps=None,  # H2Run's own tracking_sigma (0.5) throughout
-        tracking_stds=None,
     ),
 )
 
@@ -543,13 +522,13 @@ def main():
                          cwd=Path(__file__).resolve().parent).stdout.strip() or "unknown"
     config_text = "\n".join([
         f"stages={' '.join(args.stages)} alg={args.alg} history_length={args.history_length} tf32={args.tf32}",
-        f"epochs stand={args.stand_epochs} walk={args.walk_epochs} run={args.run_epochs} "
+        f"epochs stand={args.stand_epochs} walk={args.walk_epochs} "
         f"fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs} n_epochs_critic={args.n_epochs_critic}",
         f"domain_randomization={not args.no_dr} old_dr={args.old_dr} curriculum_enabled={not args.no_curriculum} "
         f"dr_params={dr_params}",
         f"privileged={list(privileged)}",
         f"gates stand_min_ep_len={args.stand_min_ep_len} walk_min_ep_len={args.walk_min_ep_len}",
-        f"env_arg={args.env_arg} stand_arg={args.stand_arg} walk_arg={args.walk_arg} run_arg={args.run_arg}",
+        f"env_arg={args.env_arg} stand_arg={args.stand_arg} walk_arg={args.walk_arg}",
         f"stage_reward_weights={STAGE_REWARD_WEIGHTS} stage_reward_params={STAGE_REWARD_PARAMS} "
         f"stage_pushes={STAGE_PUSHES}",
         f"curriculum={STAGE_CURRICULUM}",

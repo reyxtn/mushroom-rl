@@ -28,7 +28,7 @@ from .params import (
 def with_pushes(randomization_params, pushes):
     """
     The randomization params with the push entries of a task applied on top,
-    unless the caller set them: the pushes differ per task (stand, walk, run)
+    unless the caller set them: the pushes differ per task (stand, walk)
     while the rest of the randomization is shared.
 
     """

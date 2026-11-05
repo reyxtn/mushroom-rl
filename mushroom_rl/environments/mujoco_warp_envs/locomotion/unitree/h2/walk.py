@@ -357,6 +357,7 @@ class H2Walk(H2Base):
             "feet_clearance": self._reward_feet_clearance(foot_height, contact) * w["feet_clearance"] * dt,
             "feet_distance": self._reward_feet_distance(foot_pos) * w["feet_distance"] * dt,
             "gait": self._reward_gait(contact) * w["gait"] * dt,
+            "no_fly": self._reward_no_fly(contact) * w["no_fly"] * dt,
             "stand_still": self._reward_stand_still(joint_pos, joint_vel) * w["stand_still"] * dt,
         }
 
@@ -420,8 +421,12 @@ class H2Walk(H2Base):
         return (self._reward_params["feet_min_distance"] - d).clamp(min=0.0)
 
     def _reward_gait(self, contact):
-        """Fraction of feet whose contact state matches the gait schedule."""
-        return (contact == self._desired_stance()).float().mean(dim=1)
+        """One when both feet match the gait schedule, zero otherwise."""
+        return (contact == self._desired_stance()).all(dim=1).float()
+
+    def _reward_no_fly(self, contact):
+        """Both feet off the ground while a command is active."""
+        return (~contact).all(dim=1).float() * self._moving()
 
     def _reward_stand_still(self, joint_pos, joint_vel):
         """Joint deviation from the default pose plus joint speed, zero command only."""

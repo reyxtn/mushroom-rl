@@ -115,6 +115,7 @@ REWARD_TERMS = (
     "feet_clearance",
     "feet_distance",
     "gait",
+    "no_fly",
     "stand_still",
 )
 
@@ -136,7 +137,8 @@ DEFAULT_REWARD_WEIGHTS = dict(
     feet_clearance=-2.0,
     feet_distance=-2.0,
     gait=0.5,
-    stand_still=-0.5,
+    no_fly=-1.0,
+    stand_still=-1.0,
 )
 
 DEFAULT_REWARD_PARAMS = dict(
@@ -155,28 +157,13 @@ STAND_REWARD_WEIGHTS = dict(
     feet_air_time=0.0,
     feet_clearance=0.0,
     gait=1.0,
-    stand_still=-1.0,
-)
-
-# Running changes the gait, not just the speed: a flight phase in every
-# cycle, higher swing, relaxed bounce terms.
-RUN_REWARD_WEIGHTS = dict(
-    lin_vel_z=-0.5,
-    base_height=-2.0,
-    feet_air_time=1.0,
-    gait=1.0,
-)
-RUN_REWARD_PARAMS = dict(
-    feet_clearance_target=0.15,
-    feet_air_time_threshold=0.2,
+    stand_still=-2.0,
 )
 
 # Gait clock: period in seconds and duty factor. Duty > 0.5 always keeps a
-# foot on the ground, < 0.5 asks for a flight phase.
+# foot on the ground.
 WALK_GAIT = dict(gait_period=0.8, duty_factor=0.6)
-RUN_GAIT = dict(gait_period=0.5, duty_factor=0.35)
 WALK_TRACKING_SIGMA = 0.25
-RUN_TRACKING_SIGMA = 0.5
 
 # Command generators, the sampler of the old H2 tasks: uniform ranges, a
 # dead zone, per-step resampling (1/500 after 50 steps), every world tracking
@@ -195,17 +182,10 @@ STAND_COMMAND_GENERATOR = dict(
     command_ranges=dict(lin_vel_x=(0.0, 0.0), lin_vel_y=(0.0, 0.0), ang_vel_z=(-1.0, 1.0)),
     rel_standing_envs=1.0,
 )
-RUN_COMMAND_GENERATOR = dict(
-    WALK_COMMAND_GENERATOR,
-    command_ranges=dict(lin_vel_x=(1.0, 3.0), lin_vel_y=(-0.3, 0.3), ang_vel_z=(-1.0, 1.0)),
-    command_dead_zone=0.5,
-    rel_standing_envs=0.0,
-)
 
 # Pushes of the old tasks (randomizer push_probability / push_max_velocity).
 STAND_PUSHES = dict(push_probability=1.0 / 250.0, push_max_velocity=0.8)
 WALK_PUSHES = dict(push_probability=1.0 / 750.0, push_max_velocity=0.5)
-RUN_PUSHES = dict(push_probability=1.0 / 750.0, push_max_velocity=0.3)
 
 # Observation scaling, and noise half-widths in unscaled units.
 OBS_SCALES = dict(base_lin_vel=2.0, base_ang_vel=0.25, joint_pos=1.0, joint_vel=0.05, commands=(2.0, 2.0, 0.25))

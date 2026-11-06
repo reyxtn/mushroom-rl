@@ -76,7 +76,7 @@ STAGE_MIN_EP_LEN = dict(stand=200.0, walk=0.0)
 # stillness paid for, gentler pushes than the tasks' own. Stand keeps the
 # task defaults (the large alive bonus is what makes it learn to balance).
 STAGE_REWARD_WEIGHTS = dict(
-    stand=dict(),
+    stand=dict(ang_vel_xy=-0.5),
     walk=dict(
         alive=0.5,
         tracking_lin_vel=2.0,

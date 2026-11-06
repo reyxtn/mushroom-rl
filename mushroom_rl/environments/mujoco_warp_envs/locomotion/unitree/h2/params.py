@@ -148,7 +148,7 @@ DEFAULT_REWARD_PARAMS = dict(
     feet_min_distance=0.18,
     base_height_target=0.96,  # the keyframe stands at 1.01 and settles here under load
     moving_threshold=0.1,  # planar command norm above which the gait terms apply
-    stand_still_base_scale=1.0,  # base m/s and rad/s next to the joint radians in stand_still
+    stand_still_base_scale=4.0,  # base m/s and rad/s next to the joint radians in stand_still
 )
 
 # Balance in place: no step reward, more weight on height and orientation.

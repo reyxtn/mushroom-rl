@@ -138,7 +138,7 @@ DEFAULT_REWARD_WEIGHTS = dict(
     feet_distance=-2.0,
     gait=0.5,
     no_fly=-1.0,
-    stand_still=-1.0,
+    stand_still=-0.25,
 )
 
 DEFAULT_REWARD_PARAMS = dict(
@@ -148,7 +148,7 @@ DEFAULT_REWARD_PARAMS = dict(
     feet_min_distance=0.18,
     base_height_target=0.96,  # the keyframe stands at 1.01 and settles here under load
     moving_threshold=0.1,  # planar command norm above which the gait terms apply
-    stand_still_base_scale=10.0,  # base m/s and rad/s next to the joint radians in stand_still
+    stand_still_base_scale=1.0,  # base m/s and rad/s next to the joint radians in stand_still
 )
 
 # Balance in place: no step reward, more weight on height and orientation.
@@ -158,7 +158,7 @@ STAND_REWARD_WEIGHTS = dict(
     feet_air_time=0.0,
     feet_clearance=0.0,
     gait=1.0,
-    stand_still=-2.0,
+    stand_still=-0.5,
 )
 
 # Gait clock: period in seconds and duty factor. Duty > 0.5 always keeps a

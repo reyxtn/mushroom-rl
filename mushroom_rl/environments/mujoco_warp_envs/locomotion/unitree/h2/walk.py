@@ -317,7 +317,10 @@ class H2Walk(H2Base):
     def _step_finalize(self):
         super()._step_finalize()
         self._command_generator.step(self._all_envs, self._heading())
-        self._gait_phase = (self._gait_phase + self.dt / self._gait_period) % 1.0
+        # The clock only runs with a planar command; standing worlds keep
+        # phase zero so the policy has no rhythm to sway to.
+        advanced = (self._gait_phase + self.dt / self._gait_period) % 1.0
+        self._gait_phase = torch.where(self._moving(), advanced, torch.zeros_like(advanced))
 
     # ------------------------------------------------------------------
     # Reward
@@ -358,7 +361,7 @@ class H2Walk(H2Base):
             "feet_distance": self._reward_feet_distance(foot_pos) * w["feet_distance"] * dt,
             "gait": self._reward_gait(contact) * w["gait"] * dt,
             "no_fly": self._reward_no_fly(contact) * w["no_fly"] * dt,
-            "stand_still": self._reward_stand_still(joint_pos, joint_vel) * w["stand_still"] * dt,
+            "stand_still": self._reward_stand_still(joint_pos, joint_vel, lin_vel, ang_vel) * w["stand_still"] * dt,
         }
 
         total = torch.clamp(sum(r.values()), min=0.0)
@@ -428,11 +431,12 @@ class H2Walk(H2Base):
         """Both feet off the ground while a command is active."""
         return (~contact).all(dim=1).float() * self._moving()
 
-    def _reward_stand_still(self, joint_pos, joint_vel):
-        """Joint deviation from the default pose plus joint speed, zero command only."""
+    def _reward_stand_still(self, joint_pos, joint_vel, lin_vel, ang_vel):
+        """Joint deviation from the default pose, joint speed and base motion, zero command only."""
         dev = (joint_pos - self._default_joint_pos).abs().sum(dim=1)
         speed = joint_vel.abs().sum(dim=1) * self.dt
-        return (dev + speed) * self._standing()
+        base = self._reward_params["stand_still_base_scale"] * (lin_vel.norm(dim=1) + ang_vel.norm(dim=1))
+        return (dev + speed + base) * self._standing()
 
     # ------------------------------------------------------------------
     # Termination

@@ -68,6 +68,7 @@ class H2Walk(H2Base):
         command_generator=None,
         randomization_params=None,
         obs_noise=True,
+        freeze_gait_clock=True,
         **kwargs,
     ):
         self._reward_weights = dict(DEFAULT_REWARD_WEIGHTS)
@@ -89,6 +90,7 @@ class H2Walk(H2Base):
             UniformVelocityCommands(**WALK_COMMAND_GENERATOR) if command_generator is None else command_generator
         )
         self._obs_noise = obs_noise
+        self._freeze_gait_clock = freeze_gait_clock
 
         super().__init__(num_envs, randomization_params=with_pushes(randomization_params, WALK_PUSHES), **kwargs)
 
@@ -317,10 +319,10 @@ class H2Walk(H2Base):
     def _step_finalize(self):
         super()._step_finalize()
         self._command_generator.step(self._all_envs, self._heading())
-        # The clock only runs with a planar command; standing worlds keep
-        # phase zero so the policy has no rhythm to sway to.
         advanced = (self._gait_phase + self.dt / self._gait_period) % 1.0
-        self._gait_phase = torch.where(self._moving(), advanced, torch.zeros_like(advanced))
+        if self._freeze_gait_clock:
+            advanced = torch.where(self._moving(), advanced, torch.zeros_like(advanced))
+        self._gait_phase = advanced
 
     # ------------------------------------------------------------------
     # Reward

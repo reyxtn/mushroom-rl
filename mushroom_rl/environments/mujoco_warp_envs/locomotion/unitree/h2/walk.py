@@ -424,8 +424,8 @@ class H2Walk(H2Base):
         return (self._reward_params["feet_min_distance"] - d).clamp(min=0.0)
 
     def _reward_gait(self, contact):
-        """One when both feet match the gait schedule, zero otherwise."""
-        return (contact == self._desired_stance()).all(dim=1).float()
+        """Fraction of feet whose contact state matches the gait schedule."""
+        return (contact == self._desired_stance()).float().mean(dim=1)
 
     def _reward_no_fly(self, contact):
         """Both feet off the ground while a command is active."""

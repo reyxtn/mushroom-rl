@@ -173,10 +173,10 @@ WALK_COMMAND_GENERATOR = dict(
     max_command_ranges=dict(lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0)),
     command_ranges=dict(lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)),
     command_dead_zone=0.2,
-    command_resampling_time_range=None,
+    command_resampling_time_range=(4.0, 8.0),
     heading_control_stiffness=0.5,
     rel_heading_envs=1.0,
-    rel_standing_envs=0.15,
+    rel_standing_envs=0.25,
 )
 STAND_COMMAND_GENERATOR = dict(
     WALK_COMMAND_GENERATOR,

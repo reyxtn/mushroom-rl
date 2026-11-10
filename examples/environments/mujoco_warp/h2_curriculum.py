@@ -54,10 +54,18 @@ from tqdm import trange
 from mushroom_rl.core import Agent, Core, Logger
 from mushroom_rl.algorithms.actor_critic import PPO, RudinPPO
 from mushroom_rl.environments.mujoco_warp_envs import H2Walk
-from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.randomizer import RandomizationParams
-from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.networks import MaskedActorNetwork
-from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.curriculum import Curriculum
-from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.h2.params import RANDOMIZATION_OBS
+from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.randomizer import (
+    RandomizationParams,
+)
+from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.networks import (
+    MaskedActorNetwork,
+)
+from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.curriculum import (
+    Curriculum,
+)
+from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.h2.params import (
+    RANDOMIZATION_OBS,
+)
 from mushroom_rl.policy import GaussianTorchPolicy
 from mushroom_rl.approximators.parametric.networks import ActorNetwork
 from mushroom_rl.utils.torch_utils import TorchUtils
@@ -92,11 +100,11 @@ CURRICULUM = dict(
 # starts at 0.1 and changes by 0.025 % per control step, down while the mean
 # episode is shorter than 150 steps, up once it is longer than 750 (of 1000).
 PENALTY_CURRICULUM = dict(
-    initial_scale=0.1,
-    min_scale=0.0,
+    initial_scale=0.3,
+    min_scale=0.3,
     max_scale=1.0,
     level_down=150.0,
-    level_up=750.0,
+    level_up=300.0,
     degree=0.00025,
 )
 
@@ -142,20 +150,38 @@ DEFAULT_PRIVILEGED = ("actual_delay", "joint_calib_offset")
 # Agent
 # ----------------------------------------------------------------------
 
+
 def build_agent(mdp, args, batch_size, privileged):
     obs_shape = mdp.info.observation_space.shape
-    network_input_shape = (args.history_length,) + obs_shape if args.history_length > 1 else obs_shape
+    network_input_shape = (
+        (args.history_length,) + obs_shape if args.history_length > 1 else obs_shape
+    )
 
-    policy_kwargs = dict(std_0=args.std_0, n_features=args.n_features, activation=args.activation,
-                         gain_scale=args.gain_scale)
+    policy_kwargs = dict(
+        std_0=args.std_0,
+        n_features=args.n_features,
+        activation=args.activation,
+        gain_scale=args.gain_scale,
+    )
     if privileged:
         hidden = set(mdp.observation_indices(*privileged).tolist())
-        observed = torch.tensor([i for i in range(obs_shape[0]) if i not in hidden], dtype=torch.long)
-        policy = GaussianTorchPolicy(MaskedActorNetwork, network_input_shape, mdp.info.action_space.shape,
-                                     observed_indices=observed, **policy_kwargs)
+        observed = torch.tensor(
+            [i for i in range(obs_shape[0]) if i not in hidden], dtype=torch.long
+        )
+        policy = GaussianTorchPolicy(
+            MaskedActorNetwork,
+            network_input_shape,
+            mdp.info.action_space.shape,
+            observed_indices=observed,
+            **policy_kwargs,
+        )
     else:
-        policy = GaussianTorchPolicy(ActorNetwork, network_input_shape, mdp.info.action_space.shape,
-                                     **policy_kwargs)
+        policy = GaussianTorchPolicy(
+            ActorNetwork,
+            network_input_shape,
+            mdp.info.action_space.shape,
+            **policy_kwargs,
+        )
 
     adam = {"fused": True} if args.fused_adam else {}
     critic_params = dict(
@@ -181,7 +207,11 @@ def build_agent(mdp, args, batch_size, privileged):
     )
     if args.alg == "rudin":
         alg = RudinPPO
-        alg_params.update(clip_grad_norm=args.clip_grad_norm, schedule="adaptive", desired_kl=args.desired_kl)
+        alg_params.update(
+            clip_grad_norm=args.clip_grad_norm,
+            schedule="adaptive",
+            desired_kl=args.desired_kl,
+        )
     else:
         alg = PPO
     # The H2 observation is scaled in the environment, so no preprocessor.
@@ -196,7 +226,10 @@ def warm_start(agent, path, reset_std=None):
 
     """
     loaded = Agent.load(path)
-    for name, mine, theirs in (("policy", agent.policy, loaded.policy), ("critic", agent._V, loaded._V)):
+    for name, mine, theirs in (
+        ("policy", agent.policy, loaded.policy),
+        ("critic", agent._V, loaded._V),
+    ):
         w = theirs.get_weights()
         if w.shape != mine.get_weights().shape:
             raise SystemExit(
@@ -212,6 +245,7 @@ def warm_start(agent, path, reset_std=None):
 # ----------------------------------------------------------------------
 # Evaluation
 # ----------------------------------------------------------------------
+
 
 def dataset_tracking(mdp, dataset):
     """
@@ -237,6 +271,7 @@ def dataset_tracking(mdp, dataset):
 # ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
+
 
 def parse_kv(items):
     out = {}
@@ -291,12 +326,23 @@ def train(args, seed_dir, dr_params, privileged):
         observed_randomization=tuple(n for n in privileged if n in RANDOMIZATION_OBS),
         **env_kwargs,
     )
-    curriculum = Curriculum(mdp, enabled=not args.no_curriculum, penalty=PENALTY_CURRICULUM, **schedule(total_steps))
-    print(f"[curriculum] intermediate step {mdp._step_dt * 1e3:.0f} ms, latency up to "
-          f"{mdp.max_delay_steps_limit} step(s) = {params['max_delay'] * 1e3:.0f} ms"
-          + ("" if dr_on else " (randomization off)")
-          + ("" if args.no_curriculum else f"; best checkpoint looked for from step {curriculum.complete_at} on, "
-                                           "once the penalty scale is at its maximum"))
+    curriculum = Curriculum(
+        mdp,
+        enabled=not args.no_curriculum,
+        penalty=PENALTY_CURRICULUM,
+        **schedule(total_steps),
+    )
+    print(
+        f"[curriculum] intermediate step {mdp._step_dt * 1e3:.0f} ms, latency up to "
+        f"{mdp.max_delay_steps_limit} step(s) = {params['max_delay'] * 1e3:.0f} ms"
+        + ("" if dr_on else " (randomization off)")
+        + (
+            ""
+            if args.no_curriculum
+            else f"; best checkpoint looked for from step {curriculum.complete_at} on, "
+            "once the penalty scale is at its maximum"
+        )
+    )
 
     wandb_kwargs = None
     if args.wandb:
@@ -305,18 +351,39 @@ def train(args, seed_dir, dr_params, privileged):
             args.wandb_project,
             group=run_name,
             name=f"{run_name}-s{args.seed}",
-            config=dict(seed=args.seed, init_agent=args.init_agent, n_envs=n_envs, n_epochs=n_epochs,
-                        n_steps_per_fit=n_steps_per_fit, batch_size=batch_size, alg=args.alg,
-                        history_length=args.history_length, privileged=list(privileged), tf32=args.tf32,
-                        domain_randomization=dr_on, dr_params=params, env_kwargs=env_kwargs,
-                        reward_weights=mdp.reward_weights, curriculum=CURRICULUM,
-                        penalty_curriculum=PENALTY_CURRICULUM, curriculum_enabled=not args.no_curriculum,
-                        actor_lr=args.actor_lr, critic_lr=args.critic_lr, std_0=args.std_0,
-                        ent_coeff=args.ent_coeff, n_epochs_critic=args.n_epochs_critic),
+            config=dict(
+                seed=args.seed,
+                init_agent=args.init_agent,
+                n_envs=n_envs,
+                n_epochs=n_epochs,
+                n_steps_per_fit=n_steps_per_fit,
+                batch_size=batch_size,
+                alg=args.alg,
+                history_length=args.history_length,
+                privileged=list(privileged),
+                tf32=args.tf32,
+                domain_randomization=dr_on,
+                dr_params=params,
+                env_kwargs=env_kwargs,
+                reward_weights=mdp.reward_weights,
+                curriculum=CURRICULUM,
+                penalty_curriculum=PENALTY_CURRICULUM,
+                curriculum_enabled=not args.no_curriculum,
+                actor_lr=args.actor_lr,
+                critic_lr=args.critic_lr,
+                std_0=args.std_0,
+                ent_coeff=args.ent_coeff,
+                n_epochs_critic=args.n_epochs_critic,
+            ),
         )
     alg_name = "RudinPPO" if args.alg == "rudin" else "PPO"
-    logger = Logger(f"{alg_name}_{mdp.name()}", results_dir=str(seed_dir / "logs"), seed=args.seed,
-                    wandb_kwargs=wandb_kwargs, console_log_level=logging.WARNING)
+    logger = Logger(
+        f"{alg_name}_{mdp.name()}",
+        results_dir=str(seed_dir / "logs"),
+        seed=args.seed,
+        wandb_kwargs=wandb_kwargs,
+        console_log_level=logging.WARNING,
+    )
 
     agent = build_agent(mdp, args, batch_size, privileged)
     if args.init_agent is not None:
@@ -337,11 +404,23 @@ def train(args, seed_dir, dr_params, privileged):
         lin_err, ang_err, falls = dataset_tracking(mdp, dataset)
         alive = 1.0 - falls
         cur = curriculum.state()
-        logger.log_evaluation(epoch, J=J, R=R, entropy=E, mean_ep_len=L, V=V, lin_vel_err=lin_err,
-                              ang_vel_err=ang_err, alive_frac=alive, **cur)
-        line = (f"{time.strftime('%d/%m/%Y %H:%M:%S')} [INFO] Epoch {epoch} | J: {J} R: {R} entropy: {E} "
-                f"mean_ep_len: {L} V: {V} lin_vel_err: {lin_err} ang_vel_err: {ang_err} alive_frac: {alive} "
-                + " ".join(f"{k}: {v}" for k, v in cur.items()))
+        logger.log_evaluation(
+            epoch,
+            J=J,
+            R=R,
+            entropy=E,
+            mean_ep_len=L,
+            V=V,
+            lin_vel_err=lin_err,
+            ang_vel_err=ang_err,
+            alive_frac=alive,
+            **cur,
+        )
+        line = (
+            f"{time.strftime('%d/%m/%Y %H:%M:%S')} [INFO] Epoch {epoch} | J: {J} R: {R} entropy: {E} "
+            f"mean_ep_len: {L} V: {V} lin_vel_err: {lin_err} ang_vel_err: {ang_err} alive_frac: {alive} "
+            + " ".join(f"{k}: {v}" for k, v in cur.items())
+        )
         log.write(line + "\n")
         log.flush()
         last.update(J=J, epoch=epoch, ep_len=L, lin_err=lin_err, alive=alive)
@@ -364,7 +443,9 @@ def train(args, seed_dir, dr_params, privileged):
     out = seed_dir / "walk.msh"
     status = "ok"
     if "epoch" in best:
-        ckpts = sorted((seed_dir / "logs").rglob("agent*-best.msh"), key=os.path.getmtime)
+        ckpts = sorted(
+            (seed_dir / "logs").rglob("agent*-best.msh"), key=os.path.getmtime
+        )
         if not ckpts:
             raise SystemExit("no checkpoint saved")
         shutil.copy(ckpts[-1], out)
@@ -376,8 +457,10 @@ def train(args, seed_dir, dr_params, privileged):
     (seed_dir / "walk.best").write_text(
         f"{best['epoch']} {best['J']} {best['ep_len']} {best['lin_err']} {best['alive']}\n"
     )
-    print(f"[curriculum] done ({status}): epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
-          f"lin_vel_err={best['lin_err']:.3f} alive={best['alive']:.3f} -> {out}")
+    print(
+        f"[curriculum] done ({status}): epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
+        f"lin_vel_err={best['lin_err']:.3f} alive={best['alive']:.3f} -> {out}"
+    )
 
     logger.finish()
     mdp.stop()
@@ -388,46 +471,102 @@ def train(args, seed_dir, dr_params, privileged):
 # Main
 # ----------------------------------------------------------------------
 
+
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--seed", type=int, required=True)
-    p.add_argument("--run-dir", default="runs/h2_curriculum", help="sweep folder; this seed goes to seed_<seed>/")
+    p.add_argument(
+        "--run-dir",
+        default="runs/h2_curriculum",
+        help="sweep folder; this seed goes to seed_<seed>/",
+    )
     p.add_argument("--epochs", type=int, default=EPOCHS)
     p.add_argument("--init-agent", default=None, help="checkpoint to warm-start from")
-    p.add_argument("--reset-std", type=float, default=None,
-                   help="policy std to reset to after a warm start (default: keep the checkpoint's)")
-    p.add_argument("--env-arg", action="append", default=[], metavar="KEY=VALUE",
-                   help="H2Walk constructor argument (Python literal), e.g. --env-arg obs_noise=False or "
-                        "--env-arg \"reward_weights={'feet_phase': 3.0}\"")
+    p.add_argument(
+        "--reset-std",
+        type=float,
+        default=None,
+        help="policy std to reset to after a warm start (default: keep the checkpoint's)",
+    )
+    p.add_argument(
+        "--env-arg",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="H2Walk constructor argument (Python literal), e.g. --env-arg obs_noise=False or "
+        "--env-arg \"reward_weights={'feet_phase': 3.0}\"",
+    )
 
     g = p.add_argument_group("domain randomization")
-    g.add_argument("--no-dr", action="store_true",
-                   help="nothing random at all: nominal model, no pushes, no reset noise, no latency")
-    g.add_argument("--old-dr", action="store_true",
-                   help="only what the old H2Base randomized: pushes and reset noise on the nominal model")
-    g.add_argument("--dr", action="append", default=[], metavar="KEY=VALUE",
-                   help="override a DR_DEFAULTS entry, e.g. --dr position_offset=0.01 or --dr max_delay=0.01 "
-                        "(seconds); applied after --old-dr")
-    g.add_argument("--no-curriculum", action="store_true",
-                   help="final command ranges, delay, tracking sigma and penalty scale from the first update")
-    g.add_argument("--privileged", nargs="*", default=list(DEFAULT_PRIVILEGED),
-                   help="observation entries only the critic sees (names from H2Walk.observation_indices, "
-                        "e.g. actual_delay joint_calib_offset base_lin_vel); pass none for a symmetric agent")
+    g.add_argument(
+        "--no-dr",
+        action="store_true",
+        help="nothing random at all: nominal model, no pushes, no reset noise, no latency",
+    )
+    g.add_argument(
+        "--old-dr",
+        action="store_true",
+        help="only what the old H2Base randomized: pushes and reset noise on the nominal model",
+    )
+    g.add_argument(
+        "--dr",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="override a DR_DEFAULTS entry, e.g. --dr position_offset=0.01 or --dr max_delay=0.01 "
+        "(seconds); applied after --old-dr",
+    )
+    g.add_argument(
+        "--no-curriculum",
+        action="store_true",
+        help="final command ranges, delay, tracking sigma and penalty scale from the first update",
+    )
+    g.add_argument(
+        "--privileged",
+        nargs="*",
+        default=list(DEFAULT_PRIVILEGED),
+        help="observation entries only the critic sees (names from H2Walk.observation_indices, "
+        "e.g. actual_delay joint_calib_offset base_lin_vel); pass none for a symmetric agent",
+    )
 
     g = p.add_argument_group("algorithm")
-    g.add_argument("--alg", choices=("rudin", "ppo"), default="ppo",
-                   help="plain PPO, or RudinPPO (adaptive learning rate from the policy KL, gradient clipping)")
-    g.add_argument("--history-length", type=int, default=1, help="stacked observations the networks read")
+    g.add_argument(
+        "--alg",
+        choices=("rudin", "ppo"),
+        default="ppo",
+        help="plain PPO, or RudinPPO (adaptive learning rate from the policy KL, gradient clipping)",
+    )
+    g.add_argument(
+        "--history-length",
+        type=int,
+        default=1,
+        help="stacked observations the networks read",
+    )
     g.add_argument("--n-envs", type=int, default=4096)
-    g.add_argument("--fragment-length", type=int, default=24, help="on-policy steps per environment per fit")
+    g.add_argument(
+        "--fragment-length",
+        type=int,
+        default=24,
+        help="on-policy steps per environment per fit",
+    )
     g.add_argument("--fits-per-epoch", type=int, default=10)
     g.add_argument("--n-minibatches", type=int, default=16)
     g.add_argument("--n-epochs-policy", type=int, default=5)
-    g.add_argument("--n-epochs-critic", type=int, default=1,
-                   help="critic passes per fit; 1 was clearly better than 10 on the H2 under domain randomization")
+    g.add_argument(
+        "--n-epochs-critic",
+        type=int,
+        default=1,
+        help="critic passes per fit; 1 was clearly better than 10 on the H2 under domain randomization",
+    )
     g.add_argument("--n-episodes-test", type=int, default=256)
-    g.add_argument("--eval-every", type=int, default=1,
-                   help="evaluate (and consider for the best checkpoint) every N epochs, and at the last")
+    g.add_argument(
+        "--eval-every",
+        type=int,
+        default=1,
+        help="evaluate (and consider for the best checkpoint) every N epochs, and at the last",
+    )
     g.add_argument("--actor-lr", type=float, default=3e-4)
     g.add_argument("--critic-lr", type=float, default=3e-4)
     g.add_argument("--desired-kl", type=float, default=0.01)
@@ -443,8 +582,11 @@ def parse_args():
     g.add_argument("--no-fused-adam", action="store_false", dest="fused_adam")
 
     g = p.add_argument_group("compute")
-    g.add_argument("--tf32", action="store_true",
-                   help="run the matrix multiplications of the networks in TF32 on the tensor cores")
+    g.add_argument(
+        "--tf32",
+        action="store_true",
+        help="run the matrix multiplications of the networks in TF32 on the tensor cores",
+    )
     g.add_argument("--no-graph-capture", action="store_false", dest="graph_capture")
     g.add_argument("--no-wandb", action="store_false", dest="wandb")
     g.add_argument("--wandb-project", default="mushroom_rl_h2")
@@ -469,27 +611,39 @@ def main():
     if unknown:
         raise SystemExit(f"unknown --dr entries: {sorted(unknown)}")
     if "max_delay_steps" in dr_params:
-        raise SystemExit("the latency is given in seconds: --dr max_delay=0.02, not max_delay_steps")
+        raise SystemExit(
+            "the latency is given in seconds: --dr max_delay=0.02, not max_delay_steps"
+        )
     privileged = tuple(n for n in args.privileged if n.lower() != "none")
 
     run_dir = Path(args.run_dir)
     seed_dir = run_dir / f"seed_{args.seed}"
     seed_dir.mkdir(parents=True, exist_ok=True)
-    git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
-                         cwd=Path(__file__).resolve().parent).stdout.strip() or "unknown"
-    config_text = "\n".join([
-        f"alg={args.alg} history_length={args.history_length} tf32={args.tf32} init_agent={args.init_agent}",
-        f"epochs={args.epochs} fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs} "
-        f"n_epochs_critic={args.n_epochs_critic}",
-        f"domain_randomization={not args.no_dr} old_dr={args.old_dr} curriculum_enabled={not args.no_curriculum} "
-        f"dr_params={dr_params} pushes={PUSHES}",
-        f"privileged={list(privileged)}",
-        f"env_arg={args.env_arg}",
-        f"curriculum={CURRICULUM}",
-        f"penalty_curriculum={PENALTY_CURRICULUM}",
-        f"std_0={args.std_0} ent_coeff={args.ent_coeff} actor_lr={args.actor_lr} critic_lr={args.critic_lr}",
-        f"git={git}", "",
-    ])
+    git = (
+        subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parent,
+        ).stdout.strip()
+        or "unknown"
+    )
+    config_text = "\n".join(
+        [
+            f"alg={args.alg} history_length={args.history_length} tf32={args.tf32} init_agent={args.init_agent}",
+            f"epochs={args.epochs} fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs} "
+            f"n_epochs_critic={args.n_epochs_critic}",
+            f"domain_randomization={not args.no_dr} old_dr={args.old_dr} curriculum_enabled={not args.no_curriculum} "
+            f"dr_params={dr_params} pushes={PUSHES}",
+            f"privileged={list(privileged)}",
+            f"env_arg={args.env_arg}",
+            f"curriculum={CURRICULUM}",
+            f"penalty_curriculum={PENALTY_CURRICULUM}",
+            f"std_0={args.std_0} ent_coeff={args.ent_coeff} actor_lr={args.actor_lr} critic_lr={args.critic_lr}",
+            f"git={git}",
+            "",
+        ]
+    )
     # One per seed, always (a reused --run-dir would otherwise keep the first
     # run's settings), and one for the run folder if it has none yet.
     (seed_dir / "config.txt").write_text(config_text)

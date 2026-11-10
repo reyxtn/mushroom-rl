@@ -98,10 +98,18 @@ REWARD_TERMS = (
     "pose",
     "feet_distance",
     "feet_orientation",
+    "termination",
 )
 
 # The terms the penalty curriculum scales (H2Walk.penalty_scale).
-PENALTY_TERMS = ("ang_vel_xy", "orientation", "action_rate", "pose", "feet_distance", "feet_orientation")
+PENALTY_TERMS = (
+    "ang_vel_xy",
+    "orientation",
+    "action_rate",
+    "pose",
+    "feet_distance",
+    "feet_orientation",
+)
 
 DEFAULT_REWARD_WEIGHTS = dict(
     alive=1.0,
@@ -114,6 +122,7 @@ DEFAULT_REWARD_WEIGHTS = dict(
     pose=-0.5,
     feet_distance=-10.0,
     feet_orientation=-5.0,
+    termination=-1000.0,
 )
 
 DEFAULT_REWARD_PARAMS = dict(
@@ -155,8 +164,12 @@ GAIT_FREQUENCY_RANGE = (0.8, 1.2)
 # Commands: redrawn every 10 s, a fifth of the worlds standing still, as in
 # the paper; the ranges, the dead zone and the heading target are the H2's.
 WALK_COMMAND_GENERATOR = dict(
-    max_command_ranges=dict(lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0)),
-    command_ranges=dict(lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)),
+    max_command_ranges=dict(
+        lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0)
+    ),
+    command_ranges=dict(
+        lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)
+    ),
     command_dead_zone=0.2,
     command_resampling_time_range=(10.0, 10.0),
     heading_control_stiffness=0.5,
@@ -168,5 +181,17 @@ WALK_COMMAND_GENERATOR = dict(
 WALK_PUSHES = dict(push_probability=1.0 / 750.0, push_max_velocity=0.5)
 
 # Observation scaling, and noise half-widths in unscaled units.
-OBS_SCALES = dict(base_lin_vel=2.0, base_ang_vel=0.25, joint_pos=1.0, joint_vel=0.05, commands=(2.0, 2.0, 0.25))
-OBS_NOISE = dict(base_lin_vel=0.1, base_ang_vel=0.2, joint_pos=0.01, joint_vel=1.5, projected_gravity=0.05)
+OBS_SCALES = dict(
+    base_lin_vel=2.0,
+    base_ang_vel=0.25,
+    joint_pos=1.0,
+    joint_vel=0.05,
+    commands=(2.0, 2.0, 0.25),
+)
+OBS_NOISE = dict(
+    base_lin_vel=0.1,
+    base_ang_vel=0.2,
+    joint_pos=0.01,
+    joint_vel=1.5,
+    projected_gravity=0.05,
+)

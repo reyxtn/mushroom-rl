@@ -417,6 +417,8 @@ class H2Walk(H2Base):
         floor = self._reward_params["reward_floor"]
         total = torch.nan_to_num(sum(r.values()), nan=0.0, posinf=0.0, neginf=floor)
         total = torch.clamp(total, min=floor)
+        r["termination"] = absorbing.float() * w["termination"] * dt
+        total = total + r["termination"]
 
         self._reward_info = r
         self._last_actions = actions.clone()

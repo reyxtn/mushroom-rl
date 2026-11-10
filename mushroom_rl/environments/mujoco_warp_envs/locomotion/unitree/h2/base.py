@@ -17,7 +17,6 @@ from .fetch_h2_model import ensure_h2_model
 from .params import (
     ALL_JOINTS,
     DEFAULT_CONTROLLED_JOINTS,
-    POSTURE_JOINTS,
     FEET_GEOMS,
     ROOT_BODY,
     BATCHED_MODEL_FIELDS,
@@ -28,8 +27,8 @@ from .params import (
 def with_pushes(randomization_params, pushes):
     """
     The randomization params with the push entries of a task applied on top,
-    unless the caller set them: the pushes differ per task (stand, walk)
-    while the rest of the randomization is shared.
+    unless the caller set them: the pushes belong to the task while the rest
+    of the randomization is shared.
 
     """
     given = {}
@@ -200,9 +199,6 @@ class H2Base(MuJoCoWarp):
         if min(act_ids) < 0:
             raise ValueError("every controlled joint needs an actuator of the same name")
         self._ctrl_idx = torch.as_tensor(act_ids, device=dev, dtype=torch.long)
-
-        posture = [self._controlled_joints.index(j) for j in POSTURE_JOINTS if j in self._controlled_joints]
-        self._posture_idx = torch.as_tensor(posture, device=dev, dtype=torch.long)
 
         # Nominal standing pose: the "home" keyframe the build solved so the
         # feet just touch the floor.

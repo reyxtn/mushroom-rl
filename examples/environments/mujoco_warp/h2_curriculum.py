@@ -1,30 +1,32 @@
 """
-Trains the Unitree H2 locomotion curriculum, stand -> walk, for one
-seed, with domain randomization and an asymmetric actor-critic, in MuJoCo
-Warp. The go2_curriculum.py bookkeeping (seeds, eval, best checkpoint after
-the schedule completes) plus the stage chain: every stage warm-starts from
-the best checkpoint of the previous one, and a stage below its gate stops
-the chain.
+Trains the Unitree H2 velocity policy for one seed, from scratch, with domain
+randomization and an asymmetric actor-critic, in MuJoCo Warp. One policy
+walks and stands: a fifth of the worlds are commanded to stand still. The
+reward and the penalty curriculum are the locomotion recipe of Seo et al.
+2025 (arXiv 2512.01996); the bookkeeping (seeds, eval, best checkpoint after
+the schedule completes) is go2_curriculum.py's.
 
     python h2_curriculum.py --seed 1
-    for s in 1 2 3 4 5; do python h2_curriculum.py --seed $s --run-dir runs/h2_dr; done
-    python h2_curriculum.py --seed 1 --stages walk --init-agent runs/h2_dr/seed_1/stand.msh
+    for s in 1 2 3; do python h2_curriculum.py --seed $s --run-dir runs/h2; done
     python h2_curriculum.py --seed 1 --no-dr                      # nominal model, nothing random
-    python h2_curriculum.py --seed 1 --old-dr --no-curriculum --privileged none   # the old h2_sweep.sh setup
     python h2_curriculum.py --seed 1 --dr add_trunk_mass="(-5,10)" --dr max_delay=0.01
-    python h2_curriculum.py --seed 1 --walk-arg "reward_weights={'feet_slip': -2.0}"
+    python h2_curriculum.py --seed 1 --env-arg "reward_weights={'feet_phase': 3.0}"
+    python h2_curriculum.py --seed 1 --init-agent runs/h2/seed_1/walk.msh --no-curriculum   # continue a run
 
-Every seed writes to ``<run-dir>/seed_<seed>/``: ``<stage>.msh`` (best
-checkpoint of the stage), ``<stage>.best`` (its epoch and metrics),
-``<stage>.log`` (one line per evaluation), ``config.txt`` and ``status``;
-the layout ``h2_pick_best.sh`` reads.
+Every seed writes to ``<run-dir>/seed_<seed>/``: ``walk.msh`` (best
+checkpoint), ``walk.best`` (its epoch and metrics), ``walk.log`` (one line
+per evaluation), ``config.txt`` and ``status``; the layout
+``h2_pick_best.sh`` reads.
 
-Within a stage, after every policy update a schedule widens the velocity
-commands and the actuation delay and anneals the tracking tolerance; the
-environment only accepts new values, when to change them is decided by
-:class:`Curriculum`. The best checkpoint is only looked for once the
-schedule has reached its final values. ``--no-curriculum`` applies the
-final values from the first update.
+After every policy update a schedule widens the velocity commands and the
+actuation delay and anneals the tracking tolerance, and the penalty
+curriculum moves the scale of the penalty terms: down while the mean episode
+is shorter than ``level_down`` steps, up once it is longer than ``level_up``.
+The environment only accepts new values, when to change them is decided by
+:class:`Curriculum`. The best checkpoint is only looked for once every
+schedule has reached its final value; if the penalty scale never gets there,
+the last agent is kept. ``--no-curriculum`` applies the final values from
+the first update.
 
 The asymmetry: the policy network reads the observation minus the entries
 named by ``--privileged`` (by default the actuation delay and the encoder
@@ -51,7 +53,7 @@ from tqdm import trange
 
 from mushroom_rl.core import Agent, Core, Logger
 from mushroom_rl.algorithms.actor_critic import PPO, RudinPPO
-from mushroom_rl.environments.mujoco_warp_envs import H2Stand, H2Walk
+from mushroom_rl.environments.mujoco_warp_envs import H2Walk
 from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.randomizer import RandomizationParams
 from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.networks import MaskedActorNetwork
 from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.curriculum import Curriculum
@@ -60,73 +62,47 @@ from mushroom_rl.policy import GaussianTorchPolicy
 from mushroom_rl.approximators.parametric.networks import ActorNetwork
 from mushroom_rl.utils.torch_utils import TorchUtils
 
-TASKS = {"stand": H2Stand, "walk": H2Walk}
-STAGES = ("stand", "walk")
-
 # ----------------------------------------------------------------------
-# Defaults per stage. Everything here can be overridden from the command
-# line: epochs with --<stage>-epochs, environment arguments with
-# --<stage>-arg KEY=VALUE, the gate with --<stage>-min-ep-len.
+# Defaults. The reward weights and parameters are the task's own
+# (h2/params.py); override them with --env-arg reward_weights={...}.
 # ----------------------------------------------------------------------
 
-STAGE_EPOCHS = dict(stand=80, walk=120)
-STAGE_MIN_EP_LEN = dict(stand=200.0, walk=0.0)
+EPOCHS = 300
 
-# The dr_sweep3 recipe: survival worth less than tracking, posture and
-# stillness paid for, gentler pushes than the tasks' own. Stand keeps the
-# task defaults (the large alive bonus is what makes it learn to balance).
-STAGE_REWARD_WEIGHTS = dict(
-    stand=dict(ang_vel_xy=-0.5),
-    walk=dict(
-        alive=0.5,
-        tracking_lin_vel=2.0,
-        tracking_ang_vel=1.0,
-        joint_deviation=-0.5,
-        feet_slip=-1.0,
-        ang_vel_xy=-0.3,
-        action_rate=-0.03,
-    ),
-)
-STAGE_REWARD_PARAMS = dict(
-    stand=dict(),
-    walk=dict(feet_air_time_threshold=0.25),  # below the 0.32 s scheduled swing, so following the gait clock pays
-)
-STAGE_PUSHES = dict(
-    stand=dict(push_max_velocity=0.5),  # H2Stand's 1/250 interval, gentler than its 0.8 m/s
-    walk=dict(push_max_velocity=0.3),
+# On top of the task's pushes: the same interval, gentler than its 0.5 m/s.
+PUSHES = dict(push_max_velocity=0.3)
+
+# Schedules, as fractions of the run's steps per environment (turned into
+# the step counts Curriculum takes by schedule). The command ranges and the
+# delay ceiling switch in stages; the tracking kernel is interpolated
+# between the two ends of its window. Delays in seconds.
+CURRICULUM = dict(
+    command_steps=(0.3, 0.6),
+    command_ranges=[
+        dict(lin_vel_x=(-0.3, 0.5), lin_vel_y=(-0.2, 0.2)),
+        dict(lin_vel_x=(-0.5, 0.8), lin_vel_y=(-0.3, 0.3)),
+        dict(lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.4, 0.4)),
+    ],
+    delays=[0.0, 0.01, 0.02],
+    tracking_steps=(0.1, 0.5),
+    tracking_stds=(dict(sigma=0.5), dict(sigma=0.25)),
 )
 
-# Within-stage schedules, as fractions of the stage's steps per environment
-# (turned into the step counts Curriculum takes by stage_schedule). The
-# command ranges and the delay ceiling switch in stages; the tracking kernel
-# is interpolated between the two ends of its window. Delays in seconds.
-STAGE_CURRICULUM = dict(
-    stand=dict(
-        command_steps=(),
-        command_ranges=[None],
-        delays=[0.0, 0.01, 0.02],
-        delay_steps=(0.3, 0.6),
-        tracking_steps=None,
-        tracking_stds=None,
-    ),
-    walk=dict(
-        command_steps=(0.3, 0.6),
-        command_ranges=[
-            dict(lin_vel_x=(-0.3, 0.5), lin_vel_y=(-0.2, 0.2)),
-            dict(lin_vel_x=(-0.5, 0.8), lin_vel_y=(-0.3, 0.3)),
-            dict(lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.4, 0.4)),
-        ],
-        delays=[0.0, 0.01, 0.02],
-        delay_steps=(0.3, 0.6),
-        tracking_steps=(0.1, 0.5),
-        tracking_stds=(dict(sigma=0.5), dict(sigma=0.25)),
-    ),
+# Penalty curriculum, the paper's PPO preset: the scale of the penalty terms
+# starts at 0.1 and changes by 0.025 % per control step, down while the mean
+# episode is shorter than 150 steps, up once it is longer than 750 (of 1000).
+PENALTY_CURRICULUM = dict(
+    initial_scale=0.1,
+    min_scale=0.0,
+    max_scale=1.0,
+    level_down=150.0,
+    level_up=750.0,
+    degree=0.00025,
 )
 
 # Domain randomization ranges for the H2: the Isaac Go2 values scaled for a
 # 75 kg biped. ``max_delay`` is in seconds; every entry is a
-# RandomizationParams field. Pushes are per stage (STAGE_PUSHES on top of the
-# tasks' own). Any entry can be overridden with --dr KEY=VALUE.
+# RandomizationParams field. Any entry can be overridden with --dr KEY=VALUE.
 DR_DEFAULTS = dict(
     add_trunk_mass=(-2.0, 6.0),
     add_com_displacement=(-0.03, 0.03),
@@ -275,82 +251,66 @@ def parse_kv(items):
     return out
 
 
-def stage_schedule(stage, total_steps):
-    """STAGE_CURRICULUM[stage] with its fractions turned into step counts."""
-    c = STAGE_CURRICULUM[stage]
+def schedule(total_steps):
+    """CURRICULUM with its fractions turned into step counts."""
     steps = lambda fractions: [int(f * total_steps) for f in fractions]  # noqa: E731
-    # Without command stages the delay switches on its own fractions, with a
-    # single (unchanged) command range repeated for every delay stage.
-    command_steps = steps(c["command_steps"] or c["delay_steps"])
-    ranges = list(c["command_ranges"])
-    if len(ranges) == 1:
-        ranges = ranges * (len(command_steps) + 1)
     return dict(
-        command_steps=command_steps,
-        command_ranges=ranges,
-        delays=c["delays"],
-        tracking_steps=steps(c["tracking_steps"]) if c["tracking_steps"] else (0, 1),
-        tracking_stds=c["tracking_stds"],
+        CURRICULUM,
+        command_steps=steps(CURRICULUM["command_steps"]),
+        tracking_steps=steps(CURRICULUM["tracking_steps"]),
     )
 
 
-def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
-    # Every stage starts from the same RNG state, as it did when each stage
-    # was its own process.
+def train(args, seed_dir, dr_params, privileged):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     n_envs = args.n_envs
     n_steps_per_fit = n_envs * args.fragment_length
     n_steps = n_steps_per_fit * args.fits_per_epoch
-    n_epochs = getattr(args, f"{stage}_epochs")
+    n_epochs = args.epochs
     batch_size = n_steps_per_fit // args.n_minibatches
     n_fits = n_epochs * args.fits_per_epoch
     total_steps = n_fits * args.fragment_length
 
     env_kwargs = parse_kv(args.env_arg)
-    env_kwargs.update(parse_kv(getattr(args, f"{stage}_arg")))
     dr_on = env_kwargs.pop("domain_randomization", not args.no_dr)
-    reward_weights = {**STAGE_REWARD_WEIGHTS[stage], **env_kwargs.pop("reward_weights", {})}
-    reward_params = {**STAGE_REWARD_PARAMS[stage], **env_kwargs.pop("reward_params", {})}
 
     # The latency is in seconds. max_delay is also the ceiling the action
     # history is sized for, so the curriculum's delays are clamped to it
     # (--dr max_delay=0.01 caps the schedule at 10 ms, --old-dr at none).
-    params = dict(dr_params, **STAGE_PUSHES[stage])
+    params = dict(dr_params, **PUSHES)
     if not dr_on:
         params["max_delay"] = 0.0
 
-    env_cls = TASKS[stage]
-    mdp = env_cls(
+    mdp = H2Walk(
         num_envs=n_envs,
         use_graph_capture=args.graph_capture,
         domain_randomization=dr_on,
         randomization_params=params,
         max_delay_limit=params["max_delay"],
         observed_randomization=tuple(n for n in privileged if n in RANDOMIZATION_OBS),
-        reward_weights=reward_weights,
-        reward_params=reward_params,
         **env_kwargs,
     )
-    curriculum = Curriculum(mdp, enabled=not args.no_curriculum, **stage_schedule(stage, total_steps))
-    print(f"[curriculum] {stage}: intermediate step {mdp._step_dt * 1e3:.0f} ms, latency up to "
+    curriculum = Curriculum(mdp, enabled=not args.no_curriculum, penalty=PENALTY_CURRICULUM, **schedule(total_steps))
+    print(f"[curriculum] intermediate step {mdp._step_dt * 1e3:.0f} ms, latency up to "
           f"{mdp.max_delay_steps_limit} step(s) = {params['max_delay'] * 1e3:.0f} ms"
           + ("" if dr_on else " (randomization off)")
-          + ("" if args.no_curriculum else f"; best checkpoint looked for from step {curriculum.complete_at} on"))
+          + ("" if args.no_curriculum else f"; best checkpoint looked for from step {curriculum.complete_at} on, "
+                                           "once the penalty scale is at its maximum"))
 
     wandb_kwargs = None
     if args.wandb:
         run_name = Path(args.run_dir).name
         wandb_kwargs = Logger.default_wandb_kwargs(
             args.wandb_project,
-            group=f"{run_name}/seed_{args.seed}",
-            name=f"{run_name}-s{args.seed}-{stage}",
-            config=dict(stage=stage, seed=args.seed, init_agent=init_path, n_envs=n_envs, n_epochs=n_epochs,
+            group=run_name,
+            name=f"{run_name}-s{args.seed}",
+            config=dict(seed=args.seed, init_agent=args.init_agent, n_envs=n_envs, n_epochs=n_epochs,
                         n_steps_per_fit=n_steps_per_fit, batch_size=batch_size, alg=args.alg,
                         history_length=args.history_length, privileged=list(privileged), tf32=args.tf32,
                         domain_randomization=dr_on, dr_params=params, env_kwargs=env_kwargs,
-                        reward_weights=reward_weights, reward_params=reward_params,
-                        curriculum=STAGE_CURRICULUM[stage], curriculum_enabled=not args.no_curriculum,
+                        reward_weights=mdp.reward_weights, curriculum=CURRICULUM,
+                        penalty_curriculum=PENALTY_CURRICULUM, curriculum_enabled=not args.no_curriculum,
                         actor_lr=args.actor_lr, critic_lr=args.critic_lr, std_0=args.std_0,
                         ent_coeff=args.ent_coeff, n_epochs_critic=args.n_epochs_critic),
         )
@@ -359,12 +319,13 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
                     wandb_kwargs=wandb_kwargs, console_log_level=logging.WARNING)
 
     agent = build_agent(mdp, args, batch_size, privileged)
-    if init_path is not None:
-        warm_start(agent, init_path, reset_std=args.reset_std)
+    if args.init_agent is not None:
+        warm_start(agent, args.init_agent, reset_std=args.reset_std)
     core = Core(agent, mdp, callbacks_fit=[curriculum], logger=logger)
 
-    log = open(seed_dir / f"{stage}.log", "w")
+    log = open(seed_dir / "walk.log", "w")
     best = dict(J=-float("inf"))
+    last = dict()
 
     def evaluate(epoch):
         dataset = core.evaluate(n_episodes=args.n_episodes_test, render=False)
@@ -383,41 +344,44 @@ def run_stage(stage, args, seed_dir, init_path, dr_params, privileged):
                 + " ".join(f"{k}: {v}" for k, v in cur.items()))
         log.write(line + "\n")
         log.flush()
+        last.update(J=J, epoch=epoch, ep_len=L, lin_err=lin_err, alive=alive)
         # Returns from before the schedule is complete are not comparable
-        # with the ones after it, so the best checkpoint is only tracked
-        # once it is.
+        # with the ones after it (the penalties are still growing), so the
+        # best checkpoint is only tracked once it is.
         if curriculum.complete:
             logger.log_best_agent(agent, J)
             if J >= best["J"]:  # the logger saves on >= too
-                best.update(J=J, epoch=epoch, ep_len=L, lin_err=lin_err, alive=alive)
+                best.update(last)
         del dataset
 
     evaluate(0)
-    for it in trange(n_epochs, leave=False, desc=f"seed {args.seed} {stage}", ncols=80):
+    for it in trange(n_epochs, leave=False, desc=f"seed {args.seed}", ncols=80):
         core.learn(n_steps=n_steps, n_steps_per_fit=n_steps_per_fit)
         if (it + 1) % args.eval_every == 0 or it + 1 == n_epochs:
             evaluate(it + 1)
     log.close()
 
-    if "epoch" not in best:
-        raise SystemExit(f"{stage}: no evaluation ran after the schedule completed; "
-                         f"lower --eval-every or raise --{stage}-epochs")
-    ckpts = sorted((seed_dir / "logs").rglob("agent*-best.msh"), key=os.path.getmtime)
-    if not ckpts:
-        raise SystemExit(f"no checkpoint saved for {stage}")
-    out = seed_dir / f"{stage}.msh"
-    shutil.copy(ckpts[-1], out)
-    (seed_dir / f"{stage}.best").write_text(
+    out = seed_dir / "walk.msh"
+    status = "ok"
+    if "epoch" in best:
+        ckpts = sorted((seed_dir / "logs").rglob("agent*-best.msh"), key=os.path.getmtime)
+        if not ckpts:
+            raise SystemExit("no checkpoint saved")
+        shutil.copy(ckpts[-1], out)
+    else:
+        # The schedule never completed, so no best checkpoint was tracked.
+        best = last
+        agent.save(str(out))
+        status = f"schedule incomplete (penalty scale {mdp.penalty_scale:.3f}): last agent kept"
+    (seed_dir / "walk.best").write_text(
         f"{best['epoch']} {best['J']} {best['ep_len']} {best['lin_err']} {best['alive']}\n"
     )
-    print(f"[curriculum] {stage} done: best epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
+    print(f"[curriculum] done ({status}): epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
           f"lin_vel_err={best['lin_err']:.3f} alive={best['alive']:.3f} -> {out}")
 
-    logger.finish()  # one wandb run per stage
+    logger.finish()
     mdp.stop()
-    del core, agent, mdp
-    torch.cuda.empty_cache()
-    return out, best
+    return status
 
 
 # ----------------------------------------------------------------------
@@ -428,20 +392,13 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--seed", type=int, required=True)
     p.add_argument("--run-dir", default="runs/h2_curriculum", help="sweep folder; this seed goes to seed_<seed>/")
-    p.add_argument("--stages", nargs="+", choices=STAGES, default=list(STAGES))
-    p.add_argument("--init-agent", default=None, help="checkpoint the first stage warm-starts from")
+    p.add_argument("--epochs", type=int, default=EPOCHS)
+    p.add_argument("--init-agent", default=None, help="checkpoint to warm-start from")
     p.add_argument("--reset-std", type=float, default=None,
                    help="policy std to reset to after a warm start (default: keep the checkpoint's)")
-    p.add_argument("--force", action="store_true", help="ignore the gates between stages")
-    for s in STAGES:
-        p.add_argument(f"--{s}-epochs", type=int, default=STAGE_EPOCHS[s])
-        p.add_argument(f"--{s}-min-ep-len", type=float, default=STAGE_MIN_EP_LEN[s],
-                       help=f"best mean episode length {s} needs for the next stage to start")
-        p.add_argument(f"--{s}-arg", action="append", default=[], metavar="KEY=VALUE",
-                       help=f"{TASKS[s].__name__} constructor argument (Python literal), applied after --env-arg; "
-                            "reward_weights={...} and reward_params={...} merge into the stage's")
     p.add_argument("--env-arg", action="append", default=[], metavar="KEY=VALUE",
-                   help="constructor argument for every stage, e.g. --env-arg obs_noise=False")
+                   help="H2Walk constructor argument (Python literal), e.g. --env-arg obs_noise=False or "
+                        "--env-arg \"reward_weights={'feet_phase': 3.0}\"")
 
     g = p.add_argument_group("domain randomization")
     g.add_argument("--no-dr", action="store_true",
@@ -452,7 +409,7 @@ def parse_args():
                    help="override a DR_DEFAULTS entry, e.g. --dr position_offset=0.01 or --dr max_delay=0.01 "
                         "(seconds); applied after --old-dr")
     g.add_argument("--no-curriculum", action="store_true",
-                   help="final command ranges, delay and tracking sigma from the first update")
+                   help="final command ranges, delay, tracking sigma and penalty scale from the first update")
     g.add_argument("--privileged", nargs="*", default=list(DEFAULT_PRIVILEGED),
                    help="observation entries only the critic sees (names from H2Walk.observation_indices, "
                         "e.g. actual_delay joint_calib_offset base_lin_vel); pass none for a symmetric agent")
@@ -521,17 +478,15 @@ def main():
     git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
                          cwd=Path(__file__).resolve().parent).stdout.strip() or "unknown"
     config_text = "\n".join([
-        f"stages={' '.join(args.stages)} alg={args.alg} history_length={args.history_length} tf32={args.tf32}",
-        f"epochs stand={args.stand_epochs} walk={args.walk_epochs} "
-        f"fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs} n_epochs_critic={args.n_epochs_critic}",
+        f"alg={args.alg} history_length={args.history_length} tf32={args.tf32} init_agent={args.init_agent}",
+        f"epochs={args.epochs} fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs} "
+        f"n_epochs_critic={args.n_epochs_critic}",
         f"domain_randomization={not args.no_dr} old_dr={args.old_dr} curriculum_enabled={not args.no_curriculum} "
-        f"dr_params={dr_params}",
+        f"dr_params={dr_params} pushes={PUSHES}",
         f"privileged={list(privileged)}",
-        f"gates stand_min_ep_len={args.stand_min_ep_len} walk_min_ep_len={args.walk_min_ep_len}",
-        f"env_arg={args.env_arg} stand_arg={args.stand_arg} walk_arg={args.walk_arg}",
-        f"stage_reward_weights={STAGE_REWARD_WEIGHTS} stage_reward_params={STAGE_REWARD_PARAMS} "
-        f"stage_pushes={STAGE_PUSHES}",
-        f"curriculum={STAGE_CURRICULUM}",
+        f"env_arg={args.env_arg}",
+        f"curriculum={CURRICULUM}",
+        f"penalty_curriculum={PENALTY_CURRICULUM}",
         f"std_0={args.std_0} ent_coeff={args.ent_coeff} actor_lr={args.actor_lr} critic_lr={args.critic_lr}",
         f"git={git}", "",
     ])
@@ -541,17 +496,8 @@ def main():
     if not (run_dir / "config.txt").exists():
         (run_dir / "config.txt").write_text(config_text)
 
-    init_path = args.init_agent
-    status = "ok"
     try:
-        for i, stage in enumerate(args.stages):
-            out, best = run_stage(stage, args, seed_dir, init_path, dr_params, privileged)
-            init_path = str(out)
-            gate = getattr(args, f"{stage}_min_ep_len")
-            if i + 1 < len(args.stages) and not args.force and best["ep_len"] < gate:
-                status = f"gated: {stage} best ep_len {best['ep_len']:.1f} < {gate}"
-                print(f"[curriculum] {status}; not starting {args.stages[i + 1]} (use --force to override)")
-                break
+        status = train(args, seed_dir, dr_params, privileged)
     except Exception as e:  # noqa: BLE001 - recorded in status for the sweep
         (seed_dir / "status").write_text(f"failed: {type(e).__name__}: {e}\n")
         raise

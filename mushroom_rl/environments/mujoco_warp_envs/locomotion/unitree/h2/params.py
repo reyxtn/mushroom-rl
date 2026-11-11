@@ -194,17 +194,22 @@ POSE_STD_RUNNING = (
     ("wrist", 0.1),
 )
 
-# Commands: redrawn every 3 to 8 s, every world tracking a heading target,
-# one in twenty standing still, a linear command below 0.1 m/s set to zero.
-# The training script starts from narrower ranges and widens them to these.
+# Commands: redrawn every 2 to 6 s, every world tracking a heading target.
+# Three in ten stand still, and a fifth of the moving ones walk slower than
+# 0.5 m/s, so that standing, starting and stopping are practised often. A
+# linear command below 0.1 m/s is set to zero. Unitree's own: 3 to 8 s, one in
+# twenty standing, no slow walking. The training script starts from narrower
+# ranges and widens them to these.
 WALK_COMMAND_GENERATOR = dict(
     max_command_ranges=dict(lin_vel_x=(-1.0, 2.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0)),
     command_ranges=dict(lin_vel_x=(-1.0, 2.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0)),
     command_dead_zone=0.1,
-    command_resampling_time_range=(3.0, 8.0),
+    command_resampling_time_range=(2.0, 6.0),
     heading_control_stiffness=0.5,
     rel_heading_envs=1.0,
     rel_standing_envs=0.3,
+    frac_low_speed_envs=0.2,
+    low_speed_threshold=0.5,
 )
 
 # Pushes: every 5 to 6 s, never in the first 5 s (250 steps) of an episode,

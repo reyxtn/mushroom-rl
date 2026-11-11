@@ -21,6 +21,7 @@ standardizes its input.
 
 import numpy as np
 import torch
+import warp as wp
 
 from mushroom_rl.core.spaces import Box
 
@@ -344,6 +345,7 @@ class H2Walk(H2Base):
             "stand_still_joint_vel": torch.sum(torch.square(self._joint_vel()), dim=1) * (1.0 - moving),
             "stand_still_base_vel": (torch.sum(torch.square(lin_vel[:, :2]), dim=1)
                                      + torch.sum(torch.square(ang_vel), dim=1)) * (1.0 - moving),
+            "stand_still_com": self._com_offset() * (1.0 - moving),
             "self_collisions": self._self_collisions,
         }
         r = {name: value * w[name] * dt for name, value in r.items()}
@@ -361,6 +363,12 @@ class H2Walk(H2Base):
         self._last_actions = actions.clone()
         self._last_foot_contact = contact.clone()
         return total
+
+    def _com_offset(self):
+        """Squared planar distance between the centre of mass and the middle of the foot capsules. (num_envs,)"""
+        com = wp.to_torch(self._data_wp.subtree_com)[:, self._root_body, :2]
+        feet = wp.to_torch(self._data_wp.geom_xpos)[:, self._feet_geom_ids.flatten(), :2].mean(dim=1)
+        return torch.sum(torch.square(com - feet), dim=1)
 
     def _reward_track_linear_velocity(self, commands, lin_vel):
         err = torch.sum(torch.square(commands[:, :2] - lin_vel[:, :2]), dim=1) + 2.0 * torch.square(lin_vel[:, 2])

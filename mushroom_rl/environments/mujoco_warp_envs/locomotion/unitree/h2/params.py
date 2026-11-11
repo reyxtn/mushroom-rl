@@ -113,6 +113,7 @@ REWARD_TERMS = (
     "stand_still",
     "stand_still_joint_vel",
     "stand_still_base_vel",
+    "stand_still_com",
     "self_collisions",
 )
 
@@ -135,6 +136,8 @@ DEFAULT_REWARD_WEIGHTS = dict(
     # Not Unitree's: when commanded to stand, any joint or pelvis motion.
     stand_still_joint_vel=0.0,
     stand_still_base_vel=0.0,
+    # Squared planar distance, in m, between the centre of mass and the middle of the feet.
+    stand_still_com=0.0,
     self_collisions=-1.0,
 )
 

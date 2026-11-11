@@ -193,7 +193,7 @@ WALK_COMMAND_GENERATOR = dict(
     command_resampling_time_range=(3.0, 8.0),
     heading_control_stiffness=0.5,
     rel_heading_envs=1.0,
-    rel_standing_envs=0.05,
+    rel_standing_envs=0.2,
 )
 
 # Pushes: every 5 to 6 s, never in the first 5 s (250 steps) of an episode,

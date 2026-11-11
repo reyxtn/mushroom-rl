@@ -111,6 +111,8 @@ REWARD_TERMS = (
     "foot_slip",
     "soft_landing",
     "stand_still",
+    "stand_still_joint_vel",
+    "stand_still_base_vel",
     "self_collisions",
 )
 
@@ -130,6 +132,9 @@ DEFAULT_REWARD_WEIGHTS = dict(
     foot_slip=-0.25,
     soft_landing=-1e-3,
     stand_still=-1.0,
+    # Not Unitree's: when commanded to stand, any joint or pelvis motion.
+    stand_still_joint_vel=0.0,
+    stand_still_base_vel=0.0,
     self_collisions=-1.0,
 )
 
@@ -193,7 +198,7 @@ WALK_COMMAND_GENERATOR = dict(
     command_resampling_time_range=(3.0, 8.0),
     heading_control_stiffness=0.5,
     rel_heading_envs=1.0,
-    rel_standing_envs=0.2,
+    rel_standing_envs=0.05,
 )
 
 # Pushes: every 5 to 6 s, never in the first 5 s (250 steps) of an episode,

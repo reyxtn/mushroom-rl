@@ -346,6 +346,7 @@ class H2Walk(H2Base):
             "stand_still_base_vel": (torch.sum(torch.square(lin_vel[:, :2]), dim=1)
                                      + torch.sum(torch.square(ang_vel), dim=1)) * (1.0 - moving),
             "stand_still_com": self._com_offset() * (1.0 - moving),
+            "stand_still_feet": torch.sum((~contact).float(), dim=1) * (1.0 - moving),
             "self_collisions": self._self_collisions,
         }
         r = {name: value * w[name] * dt for name, value in r.items()}

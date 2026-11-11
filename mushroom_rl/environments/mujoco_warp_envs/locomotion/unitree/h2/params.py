@@ -114,6 +114,7 @@ REWARD_TERMS = (
     "stand_still_joint_vel",
     "stand_still_base_vel",
     "stand_still_com",
+    "stand_still_feet",
     "self_collisions",
 )
 
@@ -138,6 +139,8 @@ DEFAULT_REWARD_WEIGHTS = dict(
     stand_still_base_vel=0.0,
     # Squared planar distance, in m, between the centre of mass and the middle of the feet.
     stand_still_com=0.0,
+    # Feet off the floor while commanded to stand.
+    stand_still_feet=0.0,
     self_collisions=-1.0,
 )
 

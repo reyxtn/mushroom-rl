@@ -159,26 +159,15 @@ def build_agent(mdp, args, batch_size, privileged):
 
 
 def warm_start(agent, path, reset_std=None):
-    """
-    Copy the policy and critic weights of a saved agent with the same
-    observation and action layout; the optimizers start fresh. The std can
-    be reset, as a converged policy has little exploration left.
-
-    """
     loaded = Agent.load(path)
     for name, mine, theirs in (("policy", agent.policy, loaded.policy), ("critic", agent._V, loaded._V)):
         w = theirs.get_weights()
         if w.shape != mine.get_weights().shape:
-            raise SystemExit(
-                f"cannot warm-start the {name} from {path}: {w.shape[0]} weights saved, "
-                f"{mine.get_weights().shape[0]} expected. The observation layout (privileged entries, "
-                "history length) or the network size differs from the saved agent's."
-            )
+            raise SystemExit(f"cannot warm-start the {name} from {path}: shape mismatch")
         mine.set_weights(w)
+    agent._history_manager._preprocessors = loaded._history_manager._preprocessors   # new
     if reset_std is not None:
         agent.policy._log_sigma.data.fill_(math.log(reset_std))
-
-
 # ----------------------------------------------------------------------
 # Evaluation
 # ----------------------------------------------------------------------

@@ -1,3 +1,5 @@
+import math
+
 import mujoco
 import numpy as np
 import torch
@@ -17,8 +19,15 @@ from .fetch_h2_model import ensure_h2_model
 from .params import (
     ALL_JOINTS,
     DEFAULT_CONTROLLED_JOINTS,
-    FEET_GEOMS,
+    ACTION_SCALE,
+    FEET_SITES,
+    FEET_BODIES,
     ROOT_BODY,
+    TORSO_BODY,
+    FLOOR_GEOM,
+    ANGMOM_SENSOR,
+    FALL_ANGLE,
+    PUSH_EXTRA_VELOCITY,
     BATCHED_MODEL_FIELDS,
     RANDOMIZATION_OBS,
 )
@@ -42,13 +51,12 @@ def with_pushes(randomization_params, pushes):
 
 class H2Base(MuJoCoWarp):
     """
-    Base constructor for the H2 humanoid in MuJoCo Warp.
+    Base constructor for the H2 humanoid in MuJoCo Warp, on Unitree's own
+    model: collision capsules on every link (the robot collides with itself)
+    and Unitree's gains and effort limits.
 
-    The policy controls a subset of the 31 actuated joints (by default the
-    legs, the waist, the shoulders and the elbows); the others are held at
-    their default angle. The physics split is the one the H2 was trained
-    with: 2 ms physics steps, 10 per 20 ms policy step, the actuation delay
-    counted in policy steps.
+    The policy controls all 29 actuated joints by default. The physics split
+    is Unitree's: 5 ms physics steps, 4 per 20 ms policy step.
 
     """
 
@@ -58,21 +66,19 @@ class H2Base(MuJoCoWarp):
         gamma=0.99,
         horizon=1000,
         controlled_joints=None,
-        healthy_z_range=(0.6, 1.3),
-        healthy_gravity_z=-0.7,
-        terminate_when_unhealthy=True,
-        action_scale=0.25,
+        fall_angle=FALL_ANGLE,
+        terminate_when_fallen=True,
         soft_joint_limit=0.9,
         domain_randomization=True,
         randomization_params=None,
         observed_randomization=(),
         max_delay_limit=0.02,
         timestep=None,
-        n_substeps=10,
+        n_substeps=4,
         n_intermediate_steps=1,
         use_graph_capture=False,
         nconmax=None,
-        njmax=256,
+        njmax=300,
         scene="scene.xml",
         **viewer_params,
     ):
@@ -80,17 +86,18 @@ class H2Base(MuJoCoWarp):
         Args (the ones not obvious):
             controlled_joints (tuple, None): names of the joints the policy
                 controls, in action order. None is DEFAULT_CONTROLLED_JOINTS;
-            healthy_z_range (tuple): pelvis height range in which the robot
-                is considered healthy;
-            healthy_gravity_z (float): upper bound on the z component of the
-                gravity vector in the pelvis frame. -1 upright, 0 horizontal;
+                the others are held at their default angle;
+            fall_angle (float): tilt of the pelvis from upright, in radians,
+                beyond which the robot has fallen;
+            soft_joint_limit (float): fraction of every joint range, around
+                its midpoint, inside which the joint is not penalized;
             max_delay_limit (float): the largest actuation delay, in seconds,
                 the action history is sized for; ``max_delay`` can never be
                 raised above it;
             timestep, n_substeps, n_intermediate_steps: the physics split. The
                 delay resolution is ``timestep * n_substeps``. None keeps the
                 model's timestep;
-            scene (str): built from the Unitree URDF on first use, see
+            scene (str): built from Unitree's MJCF on first use, see
                 fetch_h2_model.py.
 
         """
@@ -124,10 +131,8 @@ class H2Base(MuJoCoWarp):
         self._max_delay_limit = max_delay_limit
         self._n_substeps = n_substeps
         self._randomization_params = randomization_params
-        self._healthy_z_range = healthy_z_range
-        self._healthy_gravity_z = healthy_gravity_z
-        self._terminate_when_unhealthy = terminate_when_unhealthy
-        self._action_scale = action_scale
+        self._fall_angle = fall_angle
+        self._terminate_when_fallen = terminate_when_fallen
         self._soft_joint_limit = soft_joint_limit
         self._domain_randomization = domain_randomization
         self._num_envs = num_envs
@@ -157,6 +162,9 @@ class H2Base(MuJoCoWarp):
         )
         self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.LS_ITERATIONS
         self._model_wp.opt.warn_overflow &= ~self._mj_warp.OverflowType.ITERATIONS
+        # mjlab's parallel line search, on the mujoco_warp versions that have the option.
+        if hasattr(self._model_wp.opt, "ls_parallel"):
+            self._model_wp.opt.ls_parallel = True
 
         self._build_randomizer(self._model, self._act_jids)
 
@@ -179,15 +187,15 @@ class H2Base(MuJoCoWarp):
         dev = wp.to_torch(self._data_wp.qpos).device
         self._device = dev
 
-        def jid(name):
-            i = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, name)
+        def obj_id(kind, name):
+            i = mujoco.mj_name2id(m, kind, name)
             if i < 0:
-                raise ValueError(f"joint {name!r} not in model")
+                raise ValueError(f"{name!r} not in model; rebuild it with fetch_h2_model.py")
             return i
 
         for j in ALL_JOINTS:
-            jid(j)
-        ctrl_jids = [jid(j) for j in self._controlled_joints]
+            obj_id(mujoco.mjtObj.mjOBJ_JOINT, j)
+        ctrl_jids = [obj_id(mujoco.mjtObj.mjOBJ_JOINT, j) for j in self._controlled_joints]
         act_jids = m.actuator_trnid[:, 0]
         self._act_jids = act_jids
         self._all_qpos_idx = torch.as_tensor(m.jnt_qposadr[act_jids], device=dev, dtype=torch.long)
@@ -195,9 +203,7 @@ class H2Base(MuJoCoWarp):
         self._dof_idx = torch.as_tensor(m.jnt_dofadr[ctrl_jids], device=dev, dtype=torch.long)
 
         # Every controlled joint has an actuator of the same name.
-        act_ids = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_ACTUATOR, j) for j in self._controlled_joints]
-        if min(act_ids) < 0:
-            raise ValueError("every controlled joint needs an actuator of the same name")
+        act_ids = [obj_id(mujoco.mjtObj.mjOBJ_ACTUATOR, j) for j in self._controlled_joints]
         self._ctrl_idx = torch.as_tensor(act_ids, device=dev, dtype=torch.long)
 
         # Nominal standing pose: the "home" keyframe the build solved so the
@@ -207,28 +213,45 @@ class H2Base(MuJoCoWarp):
         self._default_ctrl = key_qpos[self._all_qpos_idx].clone()  # all actuators
         self._default_joint_pos = key_qpos[self._qpos_idx].clone()  # controlled joints
 
-        # Joint limits, and soft limits shrunk towards the midpoint.
+        self._action_scale = ACTION_SCALE
+
+        # Soft joint limits, shrunk towards the midpoint of the range.
         rng = torch.as_tensor(m.jnt_range[ctrl_jids], dtype=torch.float32, device=dev)
-        self._joint_lower = rng[:, 0]
-        self._joint_upper = rng[:, 1]
         mid = 0.5 * (rng[:, 0] + rng[:, 1])
         half = 0.5 * (rng[:, 1] - rng[:, 0]) * self._soft_joint_limit
         self._soft_joint_lower = mid - half
         self._soft_joint_upper = mid + half
 
-        # Position targets are clamped to the actuator ctrlrange.
+        # Position targets are clamped to the actuator ctrlrange, which is
+        # wider than the joint range (see fetch_h2_model.py).
         ctrlrange = m.actuator_ctrlrange
         self._ctrl_lower = torch.as_tensor(ctrlrange[:, 0], dtype=torch.float32, device=dev)
         self._ctrl_upper = torch.as_tensor(ctrlrange[:, 1], dtype=torch.float32, device=dev)
 
-        self._feet_geom_ids = torch.as_tensor(
-            [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, g) for g in FEET_GEOMS], device=dev
+        # Feet: one site per foot for its position, and the collision
+        # capsules of each foot for its contact and its friction.
+        self._feet_site_ids = torch.as_tensor(
+            [obj_id(mujoco.mjtObj.mjOBJ_SITE, s) for s in FEET_SITES], device=dev
         )
-        if (self._feet_geom_ids < 0).any():
-            raise ValueError("foot geoms not found; rebuild the model with fetch_h2_model.py")
-        self._foot_half_height = torch.as_tensor(
-            m.geom_size[self._feet_geom_ids.cpu().numpy(), 2], dtype=torch.float32, device=dev
-        )
+        feet_geoms = []
+        for body in FEET_BODIES:
+            bid = obj_id(mujoco.mjtObj.mjOBJ_BODY, body)
+            feet_geoms.append([g for g in range(m.ngeom) if m.geom_bodyid[g] == bid and m.geom_contype[g]])
+        if not feet_geoms[0] or len(feet_geoms[0]) != len(feet_geoms[1]):
+            raise ValueError("foot collision geoms not found; rebuild the model with fetch_h2_model.py")
+        self._feet_geom_ids = torch.as_tensor(feet_geoms, device=dev)  # (2, geoms per foot)
+        # Which foot a geom belongs to; len(FEET_SITES) for every other geom.
+        self._geom_foot = torch.full((m.ngeom,), len(FEET_SITES), dtype=torch.long, device=dev)
+        for foot, geoms in enumerate(feet_geoms):
+            self._geom_foot[geoms] = foot
+        self._feet_body_ids = torch.as_tensor(m.site_bodyid[self._feet_site_ids.cpu().numpy()], device=dev).long()
+        self._root_body = int(m.body_rootid[self._feet_body_ids[0].item()])
+
+        self._floor_geom = obj_id(mujoco.mjtObj.mjOBJ_GEOM, FLOOR_GEOM)
+        self._torso_body = obj_id(mujoco.mjtObj.mjOBJ_BODY, TORSO_BODY)
+        adr = int(m.sensor_adr[obj_id(mujoco.mjtObj.mjOBJ_SENSOR, ANGMOM_SENSOR)])
+        self._angmom_slice = slice(adr, adr + 3)
+        self._push_extra = torch.tensor(PUSH_EXTRA_VELOCITY, dtype=torch.float32, device=dev)
 
         self._actions = torch.zeros(self._num_envs, self._n_joints, device=dev)
         self._episode_length = torch.zeros(self._num_envs, dtype=torch.long, device=dev)
@@ -247,12 +270,11 @@ class H2Base(MuJoCoWarp):
         self._ang_vel_slice = slice(base_vel[0], base_vel[0] + 3)
         self._lin_vel_slice = slice(base_vel[0] + 3, base_vel[0] + 6)
 
-        # The action is a joint position offset scaled by action_scale, so
-        # the action space is the joint range expressed in those units.
+        # The action is a joint position offset in units of the action scale,
+        # so the action space is the target range in those units.
         default_np = m.key_qpos[0][m.jnt_qposadr[ctrl_jids]]
-        rng_np = m.jnt_range[ctrl_jids]
-        action_low = (rng_np[:, 0] - default_np) / self._action_scale
-        action_high = (rng_np[:, 1] - default_np) / self._action_scale
+        action_low = (ctrlrange[act_ids, 0] - default_np) / self._action_scale
+        action_high = (ctrlrange[act_ids, 1] - default_np) / self._action_scale
         mdp_info.action_space = Box(action_low, action_high)
 
         mdp_info = super()._modify_mdp_info(mdp_info)
@@ -263,7 +285,8 @@ class H2Base(MuJoCoWarp):
         self._step_dt = m.opt.timestep * self._n_substeps
         self._max_delay_steps_limit = int(self._max_delay_limit / self._step_dt + 0.5)
         dev = self._device
-        trunk = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, ROOT_BODY)
+        # Mass and centre of mass are randomized on the torso, as Unitree does.
+        trunk = self._torso_body
         ancestors = []
         b = trunk
         while b >= 0:
@@ -282,7 +305,7 @@ class H2Base(MuJoCoWarp):
         layout = dict(
             trunk_body=trunk,
             trunk_ancestors=ancestors,
-            foot_geoms=self._feet_geom_ids,
+            foot_geoms=self._feet_geom_ids.flatten(),
             actuators=torch.arange(m.nu, device=dev),
             dofs=torch.as_tensor(m.jnt_dofadr[act_jids], device=dev, dtype=torch.long),
             joints=torch.as_tensor(act_jids, device=dev, dtype=torch.long),
@@ -414,15 +437,18 @@ class H2Base(MuJoCoWarp):
         """
         Map the policy action (W, n_joints) to position targets for all
         actuators (W, nu), once per policy step: a controlled joint gets its
-        (randomized) nominal angle plus the action times the (randomized)
-        scale, an uncontrolled one its nominal angle; every target is shifted
-        by the encoder miscalibration. The raw action is kept in
-        ``self._actions`` (observation, action rate).
+        (randomized) nominal angle plus the scaled action, an uncontrolled
+        one its nominal angle; every target is shifted by the encoder
+        miscalibration. The raw action is kept in ``self._actions``
+        (observation, action rate).
 
         """
         action = torch.as_tensor(action, dtype=torch.float32, device=self._device)
         action = torch.clamp(action, min=-100.0, max=100.0)
         self._actions[:] = action
+        # A policy step starts here. Counting it now, the observation and the
+        # reward that end the step read the same episode time.
+        self._episode_length += 1
         r = self._randomizer
         target = (r.joint_nominal_pos + r.position_offset).clone()
         target[:, self._ctrl_idx] += r.scaling_factor * action
@@ -474,11 +500,26 @@ class H2Base(MuJoCoWarp):
     # Robot state helpers
     # ------------------------------------------------------------------
 
-    def _projected_gravity(self):
-        """Gravity direction expressed in the pelvis frame. (num_envs, 3)"""
-        quat = self._read_data("base_rot")
+    def _gravity_in(self, quat):
+        """Gravity direction expressed in the frame of the given orientation. (num_envs, 3)"""
         g = torch.tensor([0.0, 0.0, -1.0], device=self._device).expand(quat.shape[0], 3)
         return self._quat_rotate_inverse(quat, g)
+
+    def _projected_gravity(self):
+        """Gravity direction expressed in the pelvis frame. (num_envs, 3)"""
+        return self._gravity_in(self._read_data("base_rot"))
+
+    def _torso_projected_gravity(self):
+        """Gravity direction expressed in the torso frame. (num_envs, 3)"""
+        return self._gravity_in(wp.to_torch(self._data_wp.xquat)[:, self._torso_body])
+
+    def _torso_ang_vel(self):
+        """Angular velocity of the torso in the world frame. (num_envs, 3)"""
+        return wp.to_torch(self._data_wp.cvel)[:, self._torso_body, :3]
+
+    def _angular_momentum(self):
+        """Angular momentum of the torso subtree about its centre of mass. (num_envs, 3)"""
+        return wp.to_torch(self._data_wp.sensordata)[:, self._angmom_slice]
 
     def _heading(self):
         """Yaw angle of the pelvis forward axis, in radians. (num_envs,)"""
@@ -496,33 +537,65 @@ class H2Base(MuJoCoWarp):
         """Angular velocity of the pelvis in its own frame (free joint qvel[3:6] is local). (num_envs, 3)"""
         return wp.to_torch(self._data_wp.qvel)[:, 3:6]
 
-    def _base_height(self):
-        return self._read_data("base_pos")[:, 2]
-
     def _joint_pos(self):
         return wp.to_torch(self._data_wp.qpos)[:, self._qpos_idx]
 
     def _joint_vel(self):
         return wp.to_torch(self._data_wp.qvel)[:, self._dof_idx]
 
-    def _joint_torque(self):
-        return wp.to_torch(self._data_wp.qfrc_actuator)[:, self._dof_idx]
+    def _joint_acc(self):
+        return wp.to_torch(self._data_wp.qacc)[:, self._dof_idx]
 
     def _foot_pos(self):
-        """World position of each foot box centre. (num_envs, 2, 3)"""
-        return wp.to_torch(self._data_wp.geom_xpos)[:, self._feet_geom_ids]
+        """World position of each foot site, at the sole. (num_envs, 2, 3)"""
+        return wp.to_torch(self._data_wp.site_xpos)[:, self._feet_site_ids]
 
-    def _foot_height(self):
-        """Height of each foot sole above the ground. (num_envs, 2)"""
-        return self._foot_pos()[:, :, 2] - self._foot_half_height
+    def _foot_vel(self):
+        """World velocity of each foot site. (num_envs, 2, 3)"""
+        # cvel is the velocity [angular, linear] of the body at the centre of
+        # mass of its kinematic tree.
+        cvel = wp.to_torch(self._data_wp.cvel)[:, self._feet_body_ids]
+        com = wp.to_torch(self._data_wp.subtree_com)[:, self._root_body]
+        return cvel[:, :, 3:] + torch.cross(cvel[:, :, :3], self._foot_pos() - com.unsqueeze(1), dim=2)
 
-    def _foot_up(self):
-        """z component of each foot's up axis, 1 when flat on the ground. (num_envs, 2)"""
-        xmat = wp.to_torch(self._data_wp.geom_xmat)[:, self._feet_geom_ids]
-        return xmat[:, :, 2, 2]
+    def _contacts(self):
+        """
+        One pass over the contact list: which feet touch the floor,
+        (num_envs, 2) bool, the normal force the floor puts on each foot,
+        (num_envs, 2), and the largest normal force between two parts of the
+        robot, (num_envs,).
+
+        """
+        W, n_feet = self._num_envs, len(FEET_SITES)
+        contact = self._data_wp.contact
+        geom = wp.to_torch(contact.geom).long().clamp(0, self._model.ngeom - 1)
+        world = wp.to_torch(contact.worldid).long().clamp(0, W - 1)
+        # nacon: the contacts of all worlds found in this step.
+        counter = self._data_wp.nacon if hasattr(self._data_wp, "nacon") else self._data_wp.ncon
+        valid = torch.arange(geom.shape[0], device=geom.device) < wp.to_torch(counter)[0]
+
+        # Normal force of a contact: the sum of its constraint rows (one row
+        # without friction, the edges of the friction pyramid with it).
+        efc_force = wp.to_torch(self._data_wp.efc.force)
+        adr = wp.to_torch(contact.efc_address).long()
+        rows = efc_force[world.unsqueeze(1), adr.clamp(0, efc_force.shape[1] - 1)]
+        force = torch.where(adr >= 0, rows, torch.zeros_like(rows)).sum(dim=1) * valid
+
+        g0, g1 = geom[:, 0], geom[:, 1]
+        with_floor = (g0 == self._floor_geom) | (g1 == self._floor_geom)
+        foot = self._geom_foot[torch.where(g0 == self._floor_geom, g1, g0)]
+        foot = torch.where(valid & with_floor, foot, torch.full_like(foot, n_feet))
+        slot = world * (n_feet + 1) + foot  # the last slot of a world collects everything else
+        zeros = torch.zeros(W * (n_feet + 1), device=geom.device)
+        foot_count = zeros.index_add(0, slot, valid.float()).view(W, n_feet + 1)[:, :n_feet]
+        foot_force = zeros.index_add(0, slot, force).view(W, n_feet + 1)[:, :n_feet]
+
+        own = torch.where(valid & ~with_floor, force, torch.zeros_like(force))
+        self_force = torch.zeros(W, device=geom.device).scatter_reduce(0, world, own, reduce="amax")
+        return foot_count > 0, foot_force, self_force
 
     # ------------------------------------------------------------------
-    # Health / termination
+    # Termination
     # ------------------------------------------------------------------
 
     def _is_finite(self):
@@ -530,16 +603,9 @@ class H2Base(MuJoCoWarp):
         qvel = wp.to_torch(self._data_wp.qvel)
         return torch.isfinite(torch.cat([qpos, qvel], dim=1)).all(dim=1)
 
-    def _is_within_z_range(self):
-        min_z, max_z = self._healthy_z_range
-        z = self._base_height()
-        return (z >= min_z) & (z <= max_z)
-
-    def _is_upright(self):
-        return self._projected_gravity()[:, 2] <= self._healthy_gravity_z
-
-    def _is_healthy(self):
-        return self._is_finite() & self._is_within_z_range() & self._is_upright()
+    def _is_fallen(self):
+        """Pelvis tilted further than fall_angle from upright."""
+        return -self._projected_gravity()[:, 2] < math.cos(self._fall_angle)
 
     # ------------------------------------------------------------------
     # Reset and domain randomisation
@@ -599,17 +665,22 @@ class H2Base(MuJoCoWarp):
         self._mj_warp.forward(self._model_wp, self._data_wp)
 
     def _step_finalize(self):
-        self._episode_length += 1
         if self._domain_randomization:
             push_idx, vel = self._randomizer.sample_disturbance(self._episode_length, self.dt)
             self._push_robots(push_idx, vel)
 
     def _push_robots(self, env_indices, velocities):
-        """Add the push to the pelvis planar velocity of the given worlds."""
+        """
+        Add the push to the pelvis velocity of the given worlds: the planar
+        part the randomizer drew, and a vertical and an angular part up to
+        PUSH_EXTRA_VELOCITY.
+
+        """
         if len(env_indices) == 0:
             return
         qvel = wp.to_torch(self._data_wp.qvel)
         qvel[env_indices, 0:2] += velocities
+        qvel[env_indices, 2:6] += self._push_extra * uniform((-1.0, 1.0), (len(env_indices), 4), self._device)
 
     def get_states(self):
         qpos = wp.to_torch(self._data_wp.qpos)

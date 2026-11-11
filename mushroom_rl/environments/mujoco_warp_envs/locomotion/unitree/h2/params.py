@@ -1,11 +1,17 @@
 """
-Constants of the Unitree H2 and of its locomotion task, kept free of
-warp/mujoco imports so the real-robot side can read them too.
+Constants of the Unitree H2 and of its velocity task, kept free of
+warp/mujoco imports so the real-robot side can read them too. The values are
+Unitree's own (unitree_rl_mjlab: h2_constants.py, velocity_env_cfg.py and
+config/h2/env_cfgs.py).
 
-Joint order is the actuator order of the model built by fetch_h2_model.py
-(the URDF joint order). Map it explicitly onto the SDK when deploying.
+Joint order is the actuator order of the model built by fetch_h2_model.py.
+Map it explicitly onto the SDK when deploying.
 
 """
+
+import math
+
+from .fetch_h2_model import FEET_BODIES, FEET_SITES, ROOT_BODY  # noqa: F401
 
 LEG_JOINTS = (
     "left_hip_pitch_joint",
@@ -22,7 +28,6 @@ LEG_JOINTS = (
     "right_ankle_pitch_joint",
 )
 WAIST_JOINTS = ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint")
-HEAD_JOINTS = ("head_pitch_joint", "head_yaw_joint")
 ARM_JOINTS = (
     "left_shoulder_pitch_joint",
     "left_shoulder_roll_joint",
@@ -39,17 +44,22 @@ ARM_JOINTS = (
     "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
 )
-UPPER_ARM_JOINTS = tuple(j for j in ARM_JOINTS if "wrist" not in j)
 
-# Every actuated joint, in actuator order. The policy controls a subset; the
-# others are held at their default angle.
-ALL_JOINTS = LEG_JOINTS + WAIST_JOINTS + HEAD_JOINTS + ARM_JOINTS
-DEFAULT_CONTROLLED_JOINTS = LEG_JOINTS + WAIST_JOINTS + UPPER_ARM_JOINTS
+# Every actuated joint, in actuator order. The policy controls all of them.
+ALL_JOINTS = LEG_JOINTS + WAIST_JOINTS + ARM_JOINTS
+DEFAULT_CONTROLLED_JOINTS = ALL_JOINTS
 
-# One box per foot (see fetch_h2_model.py); left, right.
-FEET_GEOMS = ("left_foot", "right_foot")
-ROOT_BODY = "pelvis"
+# Radians of joint target per unit of action, for every joint. Unitree's
+# h2_constants.py also computes a scale per joint (0.25 * effort limit / kp),
+# but their H2 task never applies it and runs on this default.
+ACTION_SCALE = 0.25
+
+TORSO_BODY = "torso_link"
 FLOOR_GEOM = "floor"
+ANGMOM_SENSOR = "root_angmom"  # angular momentum of the subtree of the torso
+
+# The robot is terminated when the pelvis tilts further than this.
+FALL_ANGLE = math.radians(70.0)
 
 # Model fields allocated per world, so the randomizer can write them.
 BATCHED_MODEL_FIELDS = (
@@ -80,118 +90,118 @@ RANDOMIZATION_OBS = (
 )
 
 # ---------------------------------------------------------------------------
-# Reward: the locomotion recipe of Seo et al. 2025 (arXiv 2512.01996), with
-# the terms, weights and parameters of its released PPO preset (holosoma,
-# g1_29dof_loco). Every weight carries its sign and every term is multiplied
-# by dt. The total is not clamped at zero; the penalty curriculum keeps the
-# early signal positive instead.
+# Reward: the terms, weights and parameters of Unitree's H2 velocity task,
+# under the names they have there. Every weight carries its sign and every
+# term is multiplied by dt.
 # ---------------------------------------------------------------------------
 
 REWARD_TERMS = (
-    "alive",
-    "tracking_lin_vel",
-    "tracking_ang_vel",
-    "feet_phase",
-    "ang_vel_xy",
-    "orientation",
-    "action_rate",
+    "track_linear_velocity",
+    "track_angular_velocity",
+    "body_orientation_l2",
     "pose",
-    "feet_distance",
-    "feet_orientation",
-    "termination",
-)
-
-# The terms the penalty curriculum scales (H2Walk.penalty_scale).
-PENALTY_TERMS = (
-    "ang_vel_xy",
-    "orientation",
-    "action_rate",
-    "pose",
-    "feet_distance",
-    "feet_orientation",
+    "body_ang_vel",
+    "angular_momentum",
+    "is_terminated",
+    "joint_acc_l2",
+    "joint_pos_limits",
+    "action_rate_l2",
+    "foot_gait",
+    "foot_clearance",
+    "foot_slip",
+    "soft_landing",
+    "stand_still",
+    "self_collisions",
 )
 
 DEFAULT_REWARD_WEIGHTS = dict(
-    alive=1.0,
-    tracking_lin_vel=2.0,
-    tracking_ang_vel=1.5,
-    feet_phase=5.0,
-    ang_vel_xy=-1.0,
-    orientation=-10.0,
-    action_rate=-2.0,
-    pose=-0.5,
-    feet_distance=-10.0,
-    feet_orientation=-5.0,
-    termination=-1000.0,
+    track_linear_velocity=1.0,
+    track_angular_velocity=1.0,
+    body_orientation_l2=-1.0,
+    pose=1.0,
+    body_ang_vel=-0.05,
+    angular_momentum=-0.025,
+    is_terminated=-200.0,
+    joint_acc_l2=-2.5e-7,
+    joint_pos_limits=-10.0,
+    action_rate_l2=-0.05,
+    foot_gait=0.5,
+    foot_clearance=-1.0,
+    foot_slip=-0.25,
+    soft_landing=-1e-3,
+    stand_still=-1.0,
+    self_collisions=-1.0,
 )
 
 DEFAULT_REWARD_PARAMS = dict(
-    swing_height=0.09,  # peak of the foot height profile
-    feet_phase_sigma=0.008,  # width of the foot height kernel, in m^2
-    feet_min_distance=0.125,  # lateral; 0.63 of the 0.198 the feet stand apart, as 0.15 is on the G1
-    standing_threshold=0.1,  # command norm below which the world stands
-    reward_floor=-1.0,  # per step: a diverging world must not put a huge value in the batch
+    lin_vel_std=math.sqrt(0.25),  # tracking kernels: exp(-err / std^2)
+    ang_vel_std=math.sqrt(0.5),
+    command_threshold=0.1,  # |v_xy| + |w_z| below which the world stands
+    running_threshold=1.5,  # and above which it runs
+    gait_period=0.6,  # seconds
+    gait_offsets=(0.0, 0.5),  # left, right, in cycles
+    gait_stance=0.56,  # fraction of the cycle a foot is on the ground
+    clearance_height=0.10,  # of the foot site while it moves
+    self_collision_force=10.0,  # N, above which a contact of the robot with itself counts
+    reward_floor=-10.0,  # per step, before the fall penalty: a diverging world must not flood the batch
 )
 
-# Weight of every joint in the pose term, (substring of joint name, weight).
-# First match wins. The joints that swing the leg are free, the ones that
-# splay it are not, and the upper body is held.
-POSE_WEIGHTS = (
-    ("hip_pitch", 0.01),
-    ("hip_roll", 1.0),
-    ("hip_yaw", 5.0),
-    ("knee", 0.01),
-    ("ankle", 5.0),
-    ("waist", 50.0),
-    ("head", 50.0),
-    ("shoulder", 50.0),
-    ("elbow", 50.0),
-    ("wrist", 50.0),
+# Tolerance of the pose term, per joint, (substring of joint name, std). First
+# match wins. Standing holds the default pose tightly; walking and running
+# free the joints a stride needs.
+POSE_STD_STANDING = (("joint", 0.05),)
+POSE_STD_WALKING = (
+    ("hip_pitch", 0.5),
+    ("hip_roll", 0.15),
+    ("hip_yaw", 0.15),
+    ("knee", 0.5),
+    ("ankle_roll", 0.1),
+    ("ankle_pitch", 0.15),
+    ("waist_yaw", 0.15),
+    ("waist_roll", 0.1),
+    ("waist_pitch", 0.1),
+    ("shoulder_pitch", 0.15),
+    ("shoulder_roll", 0.1),
+    ("shoulder_yaw", 0.1),
+    ("elbow", 0.1),
+    ("wrist", 0.1),
+)
+POSE_STD_RUNNING = (
+    ("hip_pitch", 0.5),
+    ("hip_roll", 0.25),
+    ("hip_yaw", 0.25),
+    ("knee", 0.5),
+    ("ankle_roll", 0.1),
+    ("ankle_pitch", 0.25),
+    ("waist_yaw", 0.25),
+    ("waist_roll", 0.1),
+    ("waist_pitch", 0.1),
+    ("shoulder_pitch", 0.25),
+    ("shoulder_roll", 0.1),
+    ("shoulder_yaw", 0.1),
+    ("elbow", 0.1),
+    ("wrist", 0.1),
 )
 
-WALK_TRACKING_SIGMA = 0.25
-
-# The mean episode length (the signal the penalty curriculum reads) runs over
-# this many finished episodes per world: 1000 episodes at 4096 worlds, as in
-# the paper.
-EPISODE_AVERAGE_WINDOW = 0.25
-
-# Gait clock: the two feet follow the same height profile half a cycle
-# apart. Under domain randomization the cadence of an episode is drawn from
-# this range, in Hz; without it the midpoint is used.
-GAIT_FREQUENCY_RANGE = (0.8, 1.2)
-
-# Commands: redrawn every 10 s, a fifth of the worlds standing still, as in
-# the paper; the ranges, the dead zone and the heading target are the H2's.
+# Commands: redrawn every 3 to 8 s, every world tracking a heading target,
+# one in twenty standing still, a linear command below 0.1 m/s set to zero.
+# The training script starts from narrower ranges and widens them to these.
 WALK_COMMAND_GENERATOR = dict(
-    max_command_ranges=dict(
-        lin_vel_x=(-3.0, 3.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0)
-    ),
-    command_ranges=dict(
-        lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.4, 0.4), ang_vel_z=(-1.0, 1.0)
-    ),
-    command_dead_zone=0.2,
-    command_resampling_time_range=(10.0, 10.0),
+    max_command_ranges=dict(lin_vel_x=(-1.0, 2.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0)),
+    command_ranges=dict(lin_vel_x=(-1.0, 2.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0)),
+    command_dead_zone=0.1,
+    command_resampling_time_range=(3.0, 8.0),
     heading_control_stiffness=0.5,
     rel_heading_envs=1.0,
-    rel_standing_envs=0.2,
+    rel_standing_envs=0.05,
 )
 
-# Pushes (randomizer push_probability / push_max_velocity).
-WALK_PUSHES = dict(push_probability=1.0 / 750.0, push_max_velocity=0.5)
+# Pushes: every 5 to 6 s, never in the first 5 s (250 steps) of an episode,
+# the randomizer adds up to push_max_velocity to the planar velocity of the
+# pelvis; the environment adds the rest of Unitree's push on top, up to these
+# values: linear z in m/s, then roll, pitch and yaw rate in rad/s.
+WALK_PUSHES = dict(push_interval_range=(5.0, 6.0), push_min_episode_length=250, push_max_velocity=0.5)
+PUSH_EXTRA_VELOCITY = (0.4, 0.52, 0.52, 0.78)
 
-# Observation scaling, and noise half-widths in unscaled units.
-OBS_SCALES = dict(
-    base_lin_vel=2.0,
-    base_ang_vel=0.25,
-    joint_pos=1.0,
-    joint_vel=0.05,
-    commands=(2.0, 2.0, 0.25),
-)
-OBS_NOISE = dict(
-    base_lin_vel=0.1,
-    base_ang_vel=0.2,
-    joint_pos=0.01,
-    joint_vel=1.5,
-    projected_gravity=0.05,
-)
+# Uniform observation noise half-widths, on what the actor reads.
+OBS_NOISE = dict(base_ang_vel=0.2, projected_gravity=0.05, joint_pos=0.01, joint_vel=1.5)

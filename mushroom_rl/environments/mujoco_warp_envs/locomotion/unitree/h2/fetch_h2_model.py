@@ -1,14 +1,15 @@
 """
-Fetch the Unitree H2 description and build an MJCF for it, on demand.
+Fetch Unitree's H2 model and turn it into the locomotion model, on demand.
 
-Unitree ships the H2 as a URDF (unitree_ros/robots/h2_description); nothing
-is committed to mushroom-rl. H2Base calls ensure_h2_model() at construction,
-and the first call on a machine fetches the pinned upstream commit, converts
-the URDF with MuJoCo, post-processes the result into a locomotion model
-(solver options, joint dynamics, two foot boxes as the only collision
-geometry, position actuators with per-joint PD gains, an IMU site, a
-standing keyframe whose height is solved so the feet just touch the floor),
-compiles it and moves it into place.
+The model is the MJCF Unitree trains the H2 on (unitree_rl_mjlab,
+src/assets/robots/unitree_h2); nothing is committed to mushroom-rl. H2Base
+calls ensure_h2_model() at construction, and the first call on a machine
+fetches the pinned upstream commit and applies what mjlab applies at run
+time there: the simulation options, the collision setup (every collision
+capsule on, self collisions included, friction only at the feet), the joint
+armature and the position actuators with Unitree's gains and effort limits.
+It adds a standing keyframe and a floor, compiles the result and moves it
+into place.
 
 Lookup order: $MUSHROOM_RL_H2_DIR if set, then the package data dir, then
 $XDG_CACHE_HOME/mushroom_rl/h2/<build id>. Pre-fetch where there is network
@@ -42,99 +43,92 @@ except ImportError:  # Windows: no inter-process lock, single process assumed
     fcntl = None
 
 
-UNITREE_ROS_URL = "https://github.com/unitreerobotics/unitree_ros.git"
+UNITREE_URL = "https://github.com/unitreerobotics/unitree_rl_mjlab.git"
 
-# Pinned upstream commit ("update G1+", 2026-09-29). Bump deliberately.
-UNITREE_ROS_COMMIT = "da52948f035165aae2709d30255f5cd3e62875a0"
+# Pinned upstream commit (2026-04-13). Bump deliberately.
+UNITREE_COMMIT = "1425b15f73bd4095f0df53709d7c389c3eb9e790"
 
-MODEL_DIR = "robots/h2_description"
-URDF_NAME = "H2.urdf"
+MODEL_DIR = "src/assets/robots/unitree_h2/xmls"
+MODEL_NAME = "h2.xml"
 ENV_VAR = "MUSHROOM_RL_H2_DIR"
 
 MODEL_FILES = ["h2.xml", "scene.xml"]
-SOURCE_FILES = ["H2.urdf"]
-ASSET_DIR = "meshes"
+ASSET_DIR = "assets"
 
 ROOT_BODY = "pelvis"
 FREE_JOINT = "floating_base_joint"
-FEET_BODIES = {
-    "left_foot": "left_ankle_pitch_link",
-    "right_foot": "right_ankle_pitch_link",
-}
+FEET_BODIES = ("left_ankle_pitch_link", "right_ankle_pitch_link")
+FEET_SITES = ("left_foot", "right_foot")
 
-# Simulation options. Same values as the vendored Go2 mjx scene.
+# Simulation options of Unitree's H2 velocity task (mjlab defaults where the
+# task sets nothing).
 OPTION = dict(
-    timestep="0.002",
-    iterations="8",
+    timestep="0.005",
+    integrator="implicitfast",
+    iterations="10",
     ls_iterations="20",
     cone="pyramidal",
-    impratio="100",
+    impratio="1",
 )
 
-# Joint dynamics, from Unitree's own MJCF (H2_loop.xml).
-JOINT_DYNAMICS = dict(damping="0.05", armature="0.01", frictionloss="0.2")
-
-# Foot contact parameters.
-# group 3: collision only, hidden by the viewer (the foot meshes in group 1
-# are what gets drawn).
-FOOT_GEOM = dict(
-    condim="3",
-    friction="0.8 0.02 0.01",
-    priority="1",
-    contype="1",
-    conaffinity="1",
-    group="3",
+# Position actuators, (substring of joint name, kp, kd, effort limit). First
+# match wins. Unitree's values (h2_constants.py).
+ACTUATORS = (
+    ("hip", 200.0, 4.0, 360.0),
+    ("knee", 200.0, 4.0, 360.0),
+    ("ankle_roll", 40.0, 2.0, 19.0),
+    ("ankle_pitch", 40.0, 2.0, 66.0),
+    ("waist", 150.0, 3.0, 120.0),
+    ("shoulder", 40.0, 2.0, 54.0),
+    ("elbow", 40.0, 2.0, 54.0),
+    ("wrist_roll", 40.0, 2.0, 54.0),
+    ("wrist", 20.0, 1.0, 25.0),
 )
+ARMATURE = "0.01"
 
-# PD gains of the position actuators, (substring of joint name, kp, kd).
-# First match wins. Starting values in the style of unitree_rl_gym's H1
-# config; they have not been tuned for the H2 and are the first thing to
-# revisit if the stand test oscillates or sags.
-GAINS = [
-    ("hip_yaw", 200.0, 5.0),
-    ("hip_roll", 200.0, 5.0),
-    ("hip_pitch", 200.0, 5.0),
-    ("knee", 300.0, 6.0),
-    ("ankle_pitch", 60.0, 2.0),
-    ("ankle_roll", 40.0, 2.0),
-    ("waist_yaw", 200.0, 5.0),
-    ("waist_roll", 300.0, 6.0),
-    ("waist_pitch", 300.0, 6.0),
-    ("head", 50.0, 1.0),
-    ("shoulder", 100.0, 2.0),
-    ("elbow", 100.0, 2.0),
-    ("wrist", 20.0, 1.0),
-]
+# Collisions: every "*_collision" capsule collides, with the floor and with
+# the other links. Only the feet have friction of their own.
+FOOT_GEOM_PATTERN = r"^(left|right)_foot[1-7]_collision$"
+FOOT_GEOM = dict(contype="1", conaffinity="1", condim="3", priority="1", friction="0.6 0.005 0.0001")
+BODY_GEOM = dict(contype="1", conaffinity="1", condim="1", priority="0")
 
-# Standing pose ("home" keyframe). Joints not listed are zero. Legs slightly
-# crouched with hip + knee + ankle summing to zero so the feet stay flat;
-# arms slightly out and bent so they clear the hips.
+# Standing pose ("home" keyframe), Unitree's. Joints not listed are zero.
 DEFAULT_POSE = {
-    "left_hip_pitch_joint": -0.3,
-    "right_hip_pitch_joint": -0.3,
-    "left_knee_joint": 0.6,
-    "right_knee_joint": 0.6,
-    "left_ankle_pitch_joint": -0.3,
-    "right_ankle_pitch_joint": -0.3,
-    "left_shoulder_pitch_joint": 0.3,
-    "right_shoulder_pitch_joint": 0.3,
-    "left_shoulder_roll_joint": 0.2,
-    "right_shoulder_roll_joint": -0.2,
-    "left_elbow_joint": 0.8,
-    "right_elbow_joint": 0.8,
+    "left_hip_pitch_joint": -0.25,
+    "right_hip_pitch_joint": -0.25,
+    "left_knee_joint": 0.5,
+    "right_knee_joint": 0.5,
+    "left_ankle_pitch_joint": -0.25,
+    "right_ankle_pitch_joint": -0.25,
+    "left_shoulder_pitch_joint": 0.35,
+    "right_shoulder_pitch_joint": 0.35,
+    "left_shoulder_roll_joint": 0.18,
+    "right_shoulder_roll_joint": -0.18,
+    "left_elbow_joint": 0.87,
+    "right_elbow_joint": 0.87,
 }
 FOOT_CLEARANCE = 0.002  # gap between sole and floor in the keyframe
+
+
+def actuator_params(joint_name):
+    """kp, kd and effort limit of the actuator of a joint."""
+    for key, kp, kd, effort in ACTUATORS:
+        if key in joint_name:
+            return kp, kd, effort
+    raise RuntimeError(f"no actuator parameters for joint {joint_name!r}; extend ACTUATORS")
 
 
 def build_id():
     """Short hash of everything that affects the generated model."""
     spec = json.dumps(
         [
-            UNITREE_ROS_COMMIT,
+            UNITREE_COMMIT,
             OPTION,
-            JOINT_DYNAMICS,
+            ACTUATORS,
+            ARMATURE,
+            FOOT_GEOM_PATTERN,
             FOOT_GEOM,
-            GAINS,
+            BODY_GEOM,
             DEFAULT_POSE,
             FOOT_CLEARANCE,
         ],
@@ -230,11 +224,11 @@ def _fetch(workdir):
             f"git not found on PATH; needed to fetch the H2 model "
             f"(or set {ENV_VAR} to an existing copy)"
         )
-    _log(f"fetching {MODEL_DIR} @ {UNITREE_ROS_COMMIT[:12]} from {UNITREE_ROS_URL}")
+    _log(f"fetching {MODEL_DIR} @ {UNITREE_COMMIT[:12]} from {UNITREE_URL}")
     repo = Path(workdir)
     repo.mkdir(parents=True)
     _git("init", "-q", cwd=repo)
-    _git("remote", "add", "origin", UNITREE_ROS_URL, cwd=repo)
+    _git("remote", "add", "origin", UNITREE_URL, cwd=repo)
     _git("config", "core.sparseCheckout", "true", cwd=repo)
     (repo / ".git" / "info" / "sparse-checkout").write_text(f"/{MODEL_DIR}/\n")
     _git(
@@ -244,76 +238,14 @@ def _fetch(workdir):
         "1",
         "--filter=blob:none",
         "origin",
-        UNITREE_ROS_COMMIT,
+        UNITREE_COMMIT,
         cwd=repo,
     )
     _git("checkout", "-q", "FETCH_HEAD", cwd=repo)
     src = repo / MODEL_DIR
-    if not src.is_dir():
-        raise RuntimeError(
-            f"{MODEL_DIR} not found in unitree_ros at {UNITREE_ROS_COMMIT}"
-        )
+    if not (src / MODEL_NAME).is_file():
+        raise RuntimeError(f"{MODEL_DIR}/{MODEL_NAME} not found in unitree_rl_mjlab at {UNITREE_COMMIT}")
     return src
-
-
-# ----------------------------------------------------------------------
-# URDF -> raw MJCF
-# ----------------------------------------------------------------------
-
-
-def _copy_and_patch_urdf(src, dest):
-    """Copy the URDF and its meshes; return the patched URDF path."""
-    dest.mkdir(parents=True)
-    text = (src / URDF_NAME).read_text().replace("\r", "")
-
-    # Only the meshes the URDF references; the folder also carries .dae
-    # duplicates and the closed-loop linkage meshes.
-    refs = sorted(set(re.findall(r'filename="meshes/([^"]+)"', text)))
-    if not refs:
-        raise RuntimeError(
-            "no mesh references found in H2.urdf; upstream layout changed"
-        )
-    (dest / ASSET_DIR).mkdir()
-    for f in refs:
-        shutil.copy2(src / ASSET_DIR / f, dest / ASSET_DIR / f)
-
-    # 1. Floating base. Upstream ships it commented out, which makes MuJoCo
-    #    weld the pelvis to the world.
-    text = text.replace(
-        '<!-- <link name="world"></link>', '<link name="world"></link>', 1
-    )
-    text = text.replace("</joint> -->", "</joint>", 1)
-    fb = text.find('<joint name="floating_base_joint" type="floating">')
-    pelvis = text.find('<link name="pelvis">')
-    if fb < 0 or pelvis < fb or "<!--" in text[fb:pelvis] or "-->" in text[fb:pelvis]:
-        raise RuntimeError(
-            "could not enable the floating base joint; upstream URDF changed"
-        )
-
-    # 2. Compiler block. Upstream sets meshdir="meshes" while the file names
-    #    already carry meshes/, which MuJoCo resolves to meshes/meshes/.
-    text, n = re.subn(
-        r"<mujoco>.*?</mujoco>",
-        '<mujoco><compiler meshdir="meshes" strippath="true" '
-        'discardvisual="false" balanceinertia="true"/></mujoco>',
-        text,
-        count=1,
-        flags=re.S,
-    )
-    if n != 1:
-        raise RuntimeError("no <mujoco> block in H2.urdf; upstream URDF changed")
-
-    urdf = dest / URDF_NAME
-    urdf.write_text(text)
-    return urdf
-
-
-def _urdf_to_mjcf(urdf, out):
-    import mujoco
-
-    model = mujoco.MjModel.from_xml_path(str(urdf))
-    mujoco.mj_saveLastXML(str(out), model)
-    return model
 
 
 # ----------------------------------------------------------------------
@@ -321,112 +253,56 @@ def _urdf_to_mjcf(urdf, out):
 # ----------------------------------------------------------------------
 
 
-def _gains(joint_name):
-    for key, kp, kd in GAINS:
-        if key in joint_name:
-            return kp, kd
-    raise RuntimeError(f"no PD gains for joint {joint_name!r}; extend GAINS")
-
-
 def _fmt(values):
     return " ".join(f"{v:.6g}" for v in values)
 
 
-def _mesh_aabb(model, mesh_id):
-    """Axis-aligned bounding box of a mesh in the frame of the geom using it."""
+def _postprocess(src_xml, out_xml):
+    """Apply to Unitree's MJCF what mjlab applies to it when the task is built."""
     import mujoco
 
-    adr, num = model.mesh_vertadr[mesh_id], model.mesh_vertnum[mesh_id]
-    v = model.mesh_vert[adr : adr + num]
-    # The compiler re-centres and re-orients every mesh onto its principal
-    # axes and stores the offset in mesh_pos / mesh_quat; mesh_vert is in
-    # that canonical frame, not in the body frame the geom was declared in.
-    rot = np.zeros(9)
-    mujoco.mju_quat2Mat(rot, model.mesh_quat[mesh_id])
-    v = v @ rot.reshape(3, 3).T + model.mesh_pos[mesh_id]
-    return v.min(axis=0), v.max(axis=0)
-
-
-def _postprocess(raw_xml, model, out_xml):
-    """Turn MuJoCo's URDF export into the locomotion model."""
-    import mujoco
-
-    tree = ET.parse(raw_xml)
+    tree = ET.parse(src_xml)
     root = tree.getroot()
-    root.set("model", "h2")
 
     compiler = root.find("compiler")
-    compiler.set("angle", "radian")
     compiler.set("autolimits", "true")
-
     option = ET.Element("option", OPTION)
     root.insert(list(root).index(compiler) + 1, option)
 
-    worldbody = root.find("worldbody")
-    pelvis = worldbody.find(f"body[@name='{ROOT_BODY}']")
-    if pelvis is None:
-        raise RuntimeError(f"root body {ROOT_BODY!r} not found after URDF import")
+    # Collisions.
+    foot = re.compile(FOOT_GEOM_PATTERN)
+    n_foot = 0
+    for geom in root.iter("geom"):
+        name = geom.get("name", "")
+        if not name.endswith("_collision"):
+            continue
+        is_foot = bool(foot.match(name))
+        n_foot += is_foot
+        for k, v in (FOOT_GEOM if is_foot else BODY_GEOM).items():
+            geom.set(k, v)
+    if n_foot != 14:
+        raise RuntimeError(f"expected 14 foot collision capsules, found {n_foot}; upstream model changed")
 
-    # Joints: name the free joint, give the hinges their dynamics.
-    hinge_names = []
-    for body in root.iter("body"):
-        for joint in body.findall("joint"):
-            if joint.get("type") == "free":
-                joint.set("name", FREE_JOINT)
-                continue
-            for k, v in JOINT_DYNAMICS.items():
-                joint.set(k, v)
-            hinge_names.append(joint.get("name"))
+    # Joints: name check on the free joint, armature on the hinges.
+    hinges = []
+    for joint in root.iter("joint"):
+        if joint.get("type") == "free":
+            if joint.get("name") != FREE_JOINT:
+                raise RuntimeError(f"free joint is {joint.get('name')!r}, expected {FREE_JOINT!r}")
+            continue
+        if joint.get("name") is None:  # the <default> entries
+            continue
+        joint.set("armature", ARMATURE)
+        hinges.append(joint)
 
-    # Collision geometry. Drop every mesh collision geom (the URDF reuses the
-    # visual meshes for collision, which is far too much for a batched GPU
-    # sim) and add one box per foot from the foot mesh's bounding box. The
-    # visual geoms already carry contype="0" conaffinity="0" group="1".
-    for body in root.iter("body"):
-        for geom in list(body.findall("geom")):
-            if geom.get("contype") != "0":
-                body.remove(geom)
-
-    mesh_ids = {
-        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_MESH, i): i
-        for i in range(model.nmesh)
-    }
-    for geom_name, body_name in FEET_BODIES.items():
-        body = worldbody.find(f".//body[@name='{body_name}']")
-        if body is None:
-            raise RuntimeError(f"foot body {body_name!r} not found")
-        lo, hi = _mesh_aabb(model, mesh_ids[body_name])
-        center, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
-        ET.SubElement(
-            body,
-            "geom",
-            dict(
-                name=geom_name,
-                type="box",
-                pos=_fmt(center),
-                size=_fmt(half),
-                **FOOT_GEOM,
-            ),
-        )
-
-    # IMU site and sensors on the pelvis.
-    ET.SubElement(pelvis, "site", dict(name="imu", pos="0 0 0", size="0.01"))
-    sensor = ET.SubElement(root, "sensor")
-    ET.SubElement(sensor, "gyro", dict(name="imu_gyro", site="imu"))
-    ET.SubElement(sensor, "accelerometer", dict(name="imu_acc", site="imu"))
-    ET.SubElement(
-        sensor, "framequat", dict(name="imu_quat", objtype="site", objname="imu")
-    )
-
-    # Position actuators, one per hinge joint, in joint order.
+    # Position actuators, one per hinge joint, in joint order. The target is
+    # not confined to the joint range: at a joint limit the policy can still
+    # ask for the full effort, as with mjlab's actuators.
     actuator = ET.SubElement(root, "actuator")
-    for name in hinge_names:
-        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        lo, hi = model.jnt_range[jid]
-        fmin, fmax = model.jnt_actfrcrange[jid]
-        if not model.jnt_actfrclimited[jid]:
-            raise RuntimeError(f"joint {name!r} has no effort limit in the URDF")
-        kp, kd = _gains(name)
+    for joint in hinges:
+        name = joint.get("name")
+        lo, hi = (float(v) for v in joint.get("range").split())
+        kp, kd, effort = actuator_params(name)
         ET.SubElement(
             actuator,
             "general",
@@ -436,10 +312,11 @@ def _postprocess(raw_xml, model, out_xml):
                 biastype="affine",
                 gainprm=_fmt([kp, 0, 0]),
                 biasprm=_fmt([0, -kp, -kd]),
-                ctrlrange=_fmt([lo, hi]),
-                forcerange=_fmt([fmin, fmax]),
+                ctrlrange=_fmt([lo - effort / kp, hi + effort / kp]),
+                forcerange=_fmt([-effort, effort]),
             ),
         )
+    hinge_names = [j.get("name") for j in hinges]
 
     unknown = set(DEFAULT_POSE) - set(hinge_names)
     if unknown:
@@ -462,10 +339,7 @@ def _postprocess(raw_xml, model, out_xml):
     qpos[2] = FOOT_CLEARANCE - _lowest_foot_point(m, d)
 
     ctrl = np.array(
-        [
-            qpos[m.jnt_qposadr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n)]]
-            for n in hinge_names
-        ]
+        [qpos[m.jnt_qposadr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, n)]] for n in hinge_names]
     )
     keyframe = ET.SubElement(root, "keyframe")
     ET.SubElement(keyframe, "key", dict(name="home", qpos=_fmt(qpos), ctrl=_fmt(ctrl)))
@@ -476,21 +350,20 @@ def _postprocess(raw_xml, model, out_xml):
 
 
 def _lowest_foot_point(m, d):
+    """Height of the lowest point of the foot capsules."""
     import mujoco
 
-    corners = np.array(
-        [[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
-    )
     lowest = np.inf
-    for geom_name in FEET_BODIES:
-        gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
-        pos, mat, half = (
-            d.geom_xpos[gid],
-            d.geom_xmat[gid].reshape(3, 3),
-            m.geom_size[gid],
-        )
-        pts = pos + (corners * half) @ mat.T
-        lowest = min(lowest, pts[:, 2].min())
+    for gid in range(m.ngeom):
+        body = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[gid])
+        if body not in FEET_BODIES or m.geom_contype[gid] == 0:
+            continue
+        if m.geom_type[gid] != mujoco.mjtGeom.mjGEOM_CAPSULE:
+            raise RuntimeError("foot collision geoms are expected to be capsules; upstream model changed")
+        radius, half = m.geom_size[gid][:2]
+        axis = d.geom_xmat[gid].reshape(3, 3)[:, 2]
+        ends = d.geom_xpos[gid][2] + np.array([-1.0, 1.0]) * half * axis[2]
+        lowest = min(lowest, ends.min() - radius)
     return lowest
 
 
@@ -515,8 +388,7 @@ SCENE_XML = """\
 
   <worldbody>
     <light pos="0 0 3.5" dir="0 0 -1" directional="true"/>
-    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" condim="3"
-      friction="0.8 0.02 0.01" contype="1" conaffinity="1"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" condim="3" contype="1" conaffinity="1"/>
   </worldbody>
 </mujoco>
 """
@@ -536,39 +408,24 @@ def _verify(dest):
 
         joint0 = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, 0)
         if joint0 != FREE_JOINT or m.jnt_type[0] != mujoco.mjtJoint.mjJNT_FREE:
-            raise RuntimeError(
-                f"{scene}: joint 0 is {joint0!r}, expected free joint {FREE_JOINT!r}"
-            )
+            raise RuntimeError(f"{scene}: joint 0 is {joint0!r}, expected free joint {FREE_JOINT!r}")
         if mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_KEY, "home") != 0:
             raise RuntimeError(f"{scene}: keyframe 'home' must be keyframe 0")
         if m.nu != m.njnt - 1:
-            raise RuntimeError(
-                f"{scene}: {m.nu} actuators for {m.njnt - 1} hinge joints"
-            )
+            raise RuntimeError(f"{scene}: {m.nu} actuators for {m.njnt - 1} hinge joints")
         if not (m.actuator_biastype == mujoco.mjtBias.mjBIAS_AFFINE).all():
             raise RuntimeError(f"{scene}: not all actuators are position-type")
+        for site in FEET_SITES:
+            if mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, site) < 0:
+                raise RuntimeError(f"{scene}: foot site {site!r} not found")
 
         mujoco.mj_resetDataKeyframe(m, d, 0)
         mujoco.mj_forward(m, d)
-        for geom_name in FEET_BODIES:
-            gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
-            up = d.geom_xmat[gid].reshape(3, 3)[2, 2]
-            dx = d.geom_xpos[gid][0] - d.xpos[1][0]
-            if up < 0.98:
-                raise RuntimeError(
-                    f"{scene}: {geom_name} is not flat in the home pose "
-                    f"(z-axis up component {up:.3f}); check DEFAULT_POSE signs"
-                )
-            if abs(dx) > 0.15:
-                raise RuntimeError(
-                    f"{scene}: {geom_name} is {dx:+.2f} m from the pelvis "
-                    "in x in the home pose; check DEFAULT_POSE signs"
-                )
         low = _lowest_foot_point(m, d)
         if abs(low - FOOT_CLEARANCE) > 1e-3:
-            raise RuntimeError(
-                f"{scene}: lowest foot point at {low:.4f}, expected {FOOT_CLEARANCE}"
-            )
+            raise RuntimeError(f"{scene}: lowest foot point at {low:.4f}, expected {FOOT_CLEARANCE}")
+        if d.ncon and scene == MODEL_FILES[0]:
+            raise RuntimeError(f"{scene}: {d.ncon} self contacts in the home pose")
 
         _log(
             f"  {scene}: nq={m.nq} nv={m.nv} nu={m.nu} nbody={m.nbody} ngeom={m.ngeom} "
@@ -582,30 +439,28 @@ def _verify(dest):
 
 
 def _build(src, dest):
-    urdf = _copy_and_patch_urdf(src, dest)
-    raw = dest / "h2_raw.xml"
-    model = _urdf_to_mjcf(urdf, raw)
-    hinge_names = _postprocess(raw, model, dest / "h2.xml")
-    raw.unlink()
+    dest.mkdir(parents=True)
+    shutil.copytree(src / ASSET_DIR, dest / ASSET_DIR)
+    hinge_names = _postprocess(src / MODEL_NAME, dest / "h2.xml")
     (dest / "scene.xml").write_text(SCENE_XML)
     (dest / "PROVENANCE.txt").write_text(
-        "Unitree H2 model, converted from the Unitree URDF\n"
-        f"Source: {UNITREE_ROS_URL}\n"
-        f"Path:   {MODEL_DIR}/{URDF_NAME}\n"
-        f"Commit: {UNITREE_ROS_COMMIT}\n"
+        "Unitree H2 model, from Unitree's MJCF\n"
+        f"Source: {UNITREE_URL}\n"
+        f"Path:   {MODEL_DIR}/{MODEL_NAME}\n"
+        f"Commit: {UNITREE_COMMIT}\n"
         f"Build:  {build_id()}\n"
         "\n"
         "Built by mushroom_rl/environments/mujoco_warp_envs/locomotion/unitree/h2/fetch_h2_model.py.\n"
-        "Licensed under the terms of the upstream repository (BSD-3-Clause,\n"
+        "Licensed under the terms of the upstream repository (Apache-2.0,\n"
         "Unitree Robotics).\n"
         "\n"
-        "Modifications relative to the upstream URDF:\n"
-        "  - floating base joint enabled;\n"
-        "  - mesh collision geoms removed, one box per foot added;\n"
-        "  - hinge joints given damping/armature/frictionloss from H2_loop.xml;\n"
-        "  - position actuators with PD gains added (see GAINS in fetch_h2_model.py);\n"
-        "  - IMU site with gyro, accelerometer and framequat sensors;\n"
-        "  - 'home' keyframe (see DEFAULT_POSE), height solved numerically.\n"
+        "Modifications relative to the upstream MJCF (what mjlab applies there at run time):\n"
+        "  - simulation options (see OPTION in fetch_h2_model.py);\n"
+        "  - collision capsules enabled, friction on the feet only (FOOT_GEOM, BODY_GEOM);\n"
+        "  - joint armature;\n"
+        "  - position actuators with PD gains and effort limits (ACTUATORS);\n"
+        "  - 'home' keyframe (DEFAULT_POSE), height solved numerically;\n"
+        "  - scene.xml with a floor.\n"
         f"Actuated joints, in actuator order:\n  " + "\n  ".join(hinge_names) + "\n"
     )
 
@@ -618,11 +473,9 @@ def fetch_h2_model(dest, force=False):
         if not force and is_complete(dest):
             return dest
 
-        with tempfile.TemporaryDirectory(
-            dir=dest.parent, prefix=f".{dest.name}.tmp-"
-        ) as tmp:
+        with tempfile.TemporaryDirectory(dir=dest.parent, prefix=f".{dest.name}.tmp-") as tmp:
             tmp = Path(tmp)
-            src = _fetch(tmp / "unitree_ros")
+            src = _fetch(tmp / "unitree_rl_mjlab")
             staged = tmp / "model"
             _build(src, staged)
             _verify(staged)
@@ -661,18 +514,14 @@ def ensure_h2_model(scene="scene.xml"):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--dest",
         type=Path,
         default=None,
         help="target directory (default: first writable lookup location)",
     )
-    parser.add_argument(
-        "--force", action="store_true", help="rebuild even if a complete copy exists"
-    )
+    parser.add_argument("--force", action="store_true", help="rebuild even if a complete copy exists")
     args = parser.parse_args()
 
     if args.dest is not None:

@@ -1,37 +1,35 @@
 """
-Trains the Unitree H2 velocity policy for one seed, from scratch, with domain
-randomization and an asymmetric actor-critic, in MuJoCo Warp. One policy
-walks and stands: a fifth of the worlds are commanded to stand still. The
-reward and the penalty curriculum are the locomotion recipe of Seo et al.
-2025 (arXiv 2512.01996); the bookkeeping (seeds, eval, best checkpoint after
-the schedule completes) is go2_curriculum.py's.
+Trains the Unitree H2 velocity policy for one seed in MuJoCo Warp, the way
+Unitree trains it (unitree_rl_mjlab, Unitree-H2-Flat): their model, reward,
+commands, randomization and PPO settings, on this repository's environment
+and RudinPPO. One policy walks, runs and stands. The bookkeeping (seeds,
+eval, best checkpoint after the schedule completes) is go2_curriculum.py's.
 
     python h2_curriculum.py --seed 1
     for s in 1 2 3; do python h2_curriculum.py --seed $s --run-dir runs/h2; done
-    python h2_curriculum.py --seed 1 --no-dr                      # nominal model, nothing random
-    python h2_curriculum.py --seed 1 --dr add_trunk_mass="(-5,10)" --dr max_delay=0.01
-    python h2_curriculum.py --seed 1 --env-arg "reward_weights={'feet_phase': 3.0}"
+    python h2_curriculum.py --seed 1 --epochs 2 --n-envs 256 --no-wandb          # smoke test
+    python h2_curriculum.py --seed 1 --no-dr                                     # nominal model, nothing random
+    python h2_curriculum.py --seed 1 --dr position_offset=0.03
+    python h2_curriculum.py --seed 1 --env-arg "reward_weights={'foot_gait': 1.0}"
     python h2_curriculum.py --seed 1 --init-agent runs/h2/seed_1/walk.msh --no-curriculum   # continue a run
 
 Every seed writes to ``<run-dir>/seed_<seed>/``: ``walk.msh`` (best
 checkpoint), ``walk.best`` (its epoch and metrics), ``walk.log`` (one line
 per evaluation), ``config.txt`` and ``status``; the layout
-``h2_pick_best.sh`` reads.
+``h2_pick_best.sh`` reads. ``walk_last.msh`` is the agent at the last
+evaluation, for a look at a run that is still training.
 
-After every policy update a schedule widens the velocity commands and the
-actuation delay and anneals the tracking tolerance, and the penalty
-curriculum moves the scale of the penalty terms: down while the mean episode
-is shorter than ``level_down`` steps, up once it is longer than ``level_up``.
-The environment only accepts new values, when to change them is decided by
-:class:`Curriculum`. The best checkpoint is only looked for once every
-schedule has reached its final value; if the penalty scale never gets there,
-the last agent is kept. ``--no-curriculum`` applies the final values from
-the first update.
+One schedule runs after every policy update: the velocity commands start
+narrow and widen to their full ranges halfway through the run, as in
+Unitree's task. The environment only accepts new values, when to change them
+is decided by :class:`Curriculum`. The best checkpoint is only looked for
+once the commands are at their final ranges. ``--no-curriculum`` applies
+them from the first update.
 
 The asymmetry: the policy network reads the observation minus the entries
-named by ``--privileged`` (by default the actuation delay and the encoder
-offset the randomization drew, which the real robot cannot measure), while
-the critic, which only runs in simulation, reads all of it.
+named by ``--privileged`` (by default what only Unitree's critic reads: the
+pelvis linear velocity and the foot heights, air times, contacts and contact
+forces), while the critic, which only runs in simulation, reads all of it.
 
 """
 
@@ -54,18 +52,11 @@ from tqdm import trange
 from mushroom_rl.core import Agent, Core, Logger
 from mushroom_rl.algorithms.actor_critic import PPO, RudinPPO
 from mushroom_rl.environments.mujoco_warp_envs import H2Walk
-from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.randomizer import (
-    RandomizationParams,
-)
-from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.networks import (
-    MaskedActorNetwork,
-)
-from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.curriculum import (
-    Curriculum,
-)
-from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.h2.params import (
-    RANDOMIZATION_OBS,
-)
+from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.randomizer import RandomizationParams
+from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.networks import MaskedActorNetwork
+from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.curriculum import Curriculum
+from mushroom_rl.environments.mujoco_warp_envs.locomotion.unitree.h2.params import RANDOMIZATION_OBS
+from mushroom_rl.rl_utils.preprocessors import StandardizationPreprocessor
 from mushroom_rl.policy import GaussianTorchPolicy
 from mushroom_rl.approximators.parametric.networks import ActorNetwork
 from mushroom_rl.utils.torch_utils import TorchUtils
@@ -75,113 +66,64 @@ from mushroom_rl.utils.torch_utils import TorchUtils
 # (h2/params.py); override them with --env-arg reward_weights={...}.
 # ----------------------------------------------------------------------
 
-EPOCHS = 300
+# With 10 fits per epoch this is Unitree's 10000 iterations.
+EPOCHS = 1000
 
-# On top of the task's pushes: the same interval, gentler than its 0.5 m/s.
-PUSHES = dict(push_max_velocity=0.3)
-
-# Schedules, as fractions of the run's steps per environment (turned into
-# the step counts Curriculum takes by schedule). The command ranges and the
-# delay ceiling switch in stages; the tracking kernel is interpolated
-# between the two ends of its window. Delays in seconds.
+# The command ranges switch at this fraction of the run's steps per
+# environment (turned into the step count Curriculum takes by schedule):
+# Unitree's two stages, the second from iteration 5000 of 10000. The yaw
+# rate range is the full one from the start. No actuation delay.
 CURRICULUM = dict(
-    command_steps=(0.3, 0.6),
+    command_steps=(0.5,),
     command_ranges=[
-        dict(lin_vel_x=(-0.3, 0.5), lin_vel_y=(-0.2, 0.2)),
-        dict(lin_vel_x=(-0.5, 0.8), lin_vel_y=(-0.3, 0.3)),
-        dict(lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.4, 0.4)),
+        dict(lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.5, 0.5)),
+        dict(lin_vel_x=(-1.0, 2.0), lin_vel_y=(-1.0, 1.0)),
     ],
-    delays=[0.0, 0.01, 0.02],
-    tracking_steps=(0.1, 0.5),
-    tracking_stds=(dict(sigma=0.5), dict(sigma=0.25)),
+    delays=[0.0, 0.0],
 )
 
-# Penalty curriculum, the paper's PPO preset: the scale of the penalty terms
-# starts at 0.1 and changes by 0.025 % per control step, down while the mean
-# episode is shorter than 150 steps, up once it is longer than 750 (of 1000).
-PENALTY_CURRICULUM = dict(
-    initial_scale=0.3,
-    min_scale=0.3,
-    max_scale=1.0,
-    level_down=150.0,
-    level_up=300.0,
-    degree=0.00025,
-)
-
-# Domain randomization ranges for the H2: the Isaac Go2 values scaled for a
-# 75 kg biped. ``max_delay`` is in seconds; every entry is a
-# RandomizationParams field. Any entry can be overridden with --dr KEY=VALUE.
+# Domain randomization, Unitree's: foot friction, encoder bias and the centre
+# of mass of the torso; the pushes are the task's own (h2/params.py). Every
+# entry is a RandomizationParams field and can be overridden with
+# --dr KEY=VALUE. The friction is 0.6 times a factor in [0.5, 1.5], where
+# Unitree draws it in [0.3, 1.6].
 DR_DEFAULTS = dict(
-    add_trunk_mass=(-2.0, 6.0),
-    add_com_displacement=(-0.03, 0.03),
-    p_gain_scale=(0.85, 1.15),
-    d_gain_scale=(0.85, 1.15),
-    ground_friction_factor=5.0 / 9.0,
-    max_delay=0.02,
+    ground_friction_factor=0.5,
+    position_offset=0.015,
+    add_com_displacement=(-0.05, 0.05),
+    add_trunk_mass=(0.0, 0.0),
+    p_gain_scale=(1.0, 1.0),
+    d_gain_scale=(1.0, 1.0),
+    max_delay=0.0,
     mixed_chance=0.0,
-    position_offset=0.02,
     reset_yaw_range=math.pi,
-    reset_joint_noise=0.1,
-    reset_base_velocity=0.2,
-    # The H2 model's spring reference (qpos_spring) is the all-zero pose, not
-    # the standing keyframe, so a joint stiffness would pull the robot away
-    # from its nominal pose. Kept inert.
+    reset_joint_noise=0.0,
+    reset_base_velocity=0.0,
     joint_stiffness=(0.0, 0.0),
 )
 
-# What the old H2Base did under the name "domain randomization": random
-# pushes, joint noise and a planar velocity at reset, on the nominal model.
-# --old-dr applies this on top of DR_DEFAULTS and --dr overrides.
-OLD_DR = dict(
-    add_trunk_mass=(0.0, 0.0),
-    add_com_displacement=(0.0, 0.0),
-    p_gain_scale=(1.0, 1.0),
-    d_gain_scale=(1.0, 1.0),
-    ground_friction_factor=0.0,
-    max_delay=0.0,
-    position_offset=0.0,
-    reset_yaw_range=0.0,
-)
-
-DEFAULT_PRIVILEGED = ("actual_delay", "joint_calib_offset")
+# What only Unitree's critic reads.
+DEFAULT_PRIVILEGED = ("base_lin_vel", "foot_height", "foot_air_time", "foot_contact", "foot_force")
 
 
 # ----------------------------------------------------------------------
 # Agent
 # ----------------------------------------------------------------------
 
-
 def build_agent(mdp, args, batch_size, privileged):
     obs_shape = mdp.info.observation_space.shape
-    network_input_shape = (
-        (args.history_length,) + obs_shape if args.history_length > 1 else obs_shape
-    )
+    network_input_shape = (args.history_length,) + obs_shape if args.history_length > 1 else obs_shape
 
-    policy_kwargs = dict(
-        std_0=args.std_0,
-        n_features=args.n_features,
-        activation=args.activation,
-        gain_scale=args.gain_scale,
-    )
+    policy_kwargs = dict(std_0=args.std_0, n_features=args.n_features, activation=args.activation,
+                         gain_scale=args.gain_scale)
     if privileged:
         hidden = set(mdp.observation_indices(*privileged).tolist())
-        observed = torch.tensor(
-            [i for i in range(obs_shape[0]) if i not in hidden], dtype=torch.long
-        )
-        policy = GaussianTorchPolicy(
-            MaskedActorNetwork,
-            network_input_shape,
-            mdp.info.action_space.shape,
-            observed_indices=observed,
-            **policy_kwargs,
-        )
+        observed = torch.tensor([i for i in range(obs_shape[0]) if i not in hidden], dtype=torch.long)
+        policy = GaussianTorchPolicy(MaskedActorNetwork, network_input_shape, mdp.info.action_space.shape,
+                                     observed_indices=observed, **policy_kwargs)
     else:
-        policy = GaussianTorchPolicy(
-            ActorNetwork,
-            network_input_shape,
-            mdp.info.action_space.shape,
-            **policy_kwargs,
-        )
+        policy = GaussianTorchPolicy(ActorNetwork, network_input_shape, mdp.info.action_space.shape,
+                                     **policy_kwargs)
 
     adam = {"fused": True} if args.fused_adam else {}
     critic_params = dict(
@@ -207,15 +149,13 @@ def build_agent(mdp, args, batch_size, privileged):
     )
     if args.alg == "rudin":
         alg = RudinPPO
-        alg_params.update(
-            clip_grad_norm=args.clip_grad_norm,
-            schedule="adaptive",
-            desired_kl=args.desired_kl,
-        )
+        alg_params.update(clip_grad_norm=args.clip_grad_norm, schedule="adaptive", desired_kl=args.desired_kl)
     else:
         alg = PPO
-    # The H2 observation is scaled in the environment, so no preprocessor.
-    return alg(mdp.info, policy, critic_params=critic_params, **alg_params)
+    agent = alg(mdp.info, policy, critic_params=critic_params, **alg_params)
+    # Unitree normalizes the observation in the networks; here the agent does.
+    agent.add_agent_preprocessor(StandardizationPreprocessor(mdp.info, backend="torch"))
+    return agent
 
 
 def warm_start(agent, path, reset_std=None):
@@ -226,10 +166,7 @@ def warm_start(agent, path, reset_std=None):
 
     """
     loaded = Agent.load(path)
-    for name, mine, theirs in (
-        ("policy", agent.policy, loaded.policy),
-        ("critic", agent._V, loaded._V),
-    ):
+    for name, mine, theirs in (("policy", agent.policy, loaded.policy), ("critic", agent._V, loaded._V)):
         w = theirs.get_weights()
         if w.shape != mine.get_weights().shape:
             raise SystemExit(
@@ -246,21 +183,11 @@ def warm_start(agent, path, reset_std=None):
 # Evaluation
 # ----------------------------------------------------------------------
 
-
 def dataset_tracking(mdp, dataset):
-    """
-    Mean |v_xy - cmd| and |w_z - cmd| over the evaluation dataset, in m/s and
-    rad/s (the observation is scaled, so the scaling is undone), and the fall
-    rate.
-
-    """
-    scale = mdp._normalization_vec
-    cmd_idx = mdp.observation_indices("commands")
-    lin_idx = mdp.observation_indices("base_lin_vel")
-    ang_idx = mdp.observation_indices("base_ang_vel")
-    commands = dataset.state[:, cmd_idx] / scale[cmd_idx]
-    lin_vel = dataset.state[:, lin_idx] / scale[lin_idx]
-    ang_vel = dataset.state[:, ang_idx] / scale[ang_idx]
+    """Mean |v_xy - cmd| and |w_z - cmd| over the evaluation dataset, in m/s and rad/s, and the fall rate."""
+    commands = dataset.state[:, mdp.observation_indices("commands")]
+    lin_vel = dataset.state[:, mdp.observation_indices("base_lin_vel")]
+    ang_vel = dataset.state[:, mdp.observation_indices("base_ang_vel")]
     lin_err = torch.linalg.norm(commands[:, :2] - lin_vel[:, :2], dim=1).mean().item()
     ang_err = (commands[:, 2] - ang_vel[:, 2]).abs().mean().item()
     n_episodes = max(int(dataset.n_episodes), 1)
@@ -271,7 +198,6 @@ def dataset_tracking(mdp, dataset):
 # ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
-
 
 def parse_kv(items):
     out = {}
@@ -287,12 +213,12 @@ def parse_kv(items):
 
 
 def schedule(total_steps):
-    """CURRICULUM with its fractions turned into step counts."""
-    steps = lambda fractions: [int(f * total_steps) for f in fractions]  # noqa: E731
+    """CURRICULUM with its fractions turned into step counts; the tracking kernel has no schedule."""
     return dict(
         CURRICULUM,
-        command_steps=steps(CURRICULUM["command_steps"]),
-        tracking_steps=steps(CURRICULUM["tracking_steps"]),
+        command_steps=[int(f * total_steps) for f in CURRICULUM["command_steps"]],
+        tracking_steps=(0, 1),
+        tracking_stds=None,
     )
 
 
@@ -311,9 +237,8 @@ def train(args, seed_dir, dr_params, privileged):
     dr_on = env_kwargs.pop("domain_randomization", not args.no_dr)
 
     # The latency is in seconds. max_delay is also the ceiling the action
-    # history is sized for, so the curriculum's delays are clamped to it
-    # (--dr max_delay=0.01 caps the schedule at 10 ms, --old-dr at none).
-    params = dict(dr_params, **PUSHES)
+    # history is sized for.
+    params = dict(dr_params)
     if not dr_on:
         params["max_delay"] = 0.0
 
@@ -326,23 +251,11 @@ def train(args, seed_dir, dr_params, privileged):
         observed_randomization=tuple(n for n in privileged if n in RANDOMIZATION_OBS),
         **env_kwargs,
     )
-    curriculum = Curriculum(
-        mdp,
-        enabled=not args.no_curriculum,
-        penalty=PENALTY_CURRICULUM,
-        **schedule(total_steps),
-    )
-    print(
-        f"[curriculum] intermediate step {mdp._step_dt * 1e3:.0f} ms, latency up to "
-        f"{mdp.max_delay_steps_limit} step(s) = {params['max_delay'] * 1e3:.0f} ms"
-        + ("" if dr_on else " (randomization off)")
-        + (
-            ""
-            if args.no_curriculum
-            else f"; best checkpoint looked for from step {curriculum.complete_at} on, "
-            "once the penalty scale is at its maximum"
-        )
-    )
+    curriculum = Curriculum(mdp, enabled=not args.no_curriculum, **schedule(total_steps))
+    print(f"[curriculum] policy step {mdp.dt * 1e3:.0f} ms, observation {mdp.info.observation_space.shape[0]}, "
+          f"action {mdp.info.action_space.shape[0]}"
+          + ("" if dr_on else ", randomization off")
+          + ("" if args.no_curriculum else f"; best checkpoint looked for from step {curriculum.complete_at} on"))
 
     wandb_kwargs = None
     if args.wandb:
@@ -351,39 +264,18 @@ def train(args, seed_dir, dr_params, privileged):
             args.wandb_project,
             group=run_name,
             name=f"{run_name}-s{args.seed}",
-            config=dict(
-                seed=args.seed,
-                init_agent=args.init_agent,
-                n_envs=n_envs,
-                n_epochs=n_epochs,
-                n_steps_per_fit=n_steps_per_fit,
-                batch_size=batch_size,
-                alg=args.alg,
-                history_length=args.history_length,
-                privileged=list(privileged),
-                tf32=args.tf32,
-                domain_randomization=dr_on,
-                dr_params=params,
-                env_kwargs=env_kwargs,
-                reward_weights=mdp.reward_weights,
-                curriculum=CURRICULUM,
-                penalty_curriculum=PENALTY_CURRICULUM,
-                curriculum_enabled=not args.no_curriculum,
-                actor_lr=args.actor_lr,
-                critic_lr=args.critic_lr,
-                std_0=args.std_0,
-                ent_coeff=args.ent_coeff,
-                n_epochs_critic=args.n_epochs_critic,
-            ),
+            config=dict(seed=args.seed, init_agent=args.init_agent, n_envs=n_envs, n_epochs=n_epochs,
+                        n_steps_per_fit=n_steps_per_fit, batch_size=batch_size, alg=args.alg,
+                        history_length=args.history_length, privileged=list(privileged), tf32=args.tf32,
+                        domain_randomization=dr_on, dr_params=params, env_kwargs=env_kwargs,
+                        reward_weights=mdp.reward_weights, curriculum=CURRICULUM,
+                        curriculum_enabled=not args.no_curriculum,
+                        actor_lr=args.actor_lr, critic_lr=args.critic_lr, std_0=args.std_0,
+                        ent_coeff=args.ent_coeff, n_epochs_critic=args.n_epochs_critic),
         )
     alg_name = "RudinPPO" if args.alg == "rudin" else "PPO"
-    logger = Logger(
-        f"{alg_name}_{mdp.name()}",
-        results_dir=str(seed_dir / "logs"),
-        seed=args.seed,
-        wandb_kwargs=wandb_kwargs,
-        console_log_level=logging.WARNING,
-    )
+    logger = Logger(f"{alg_name}_{mdp.name()}", results_dir=str(seed_dir / "logs"), seed=args.seed,
+                    wandb_kwargs=wandb_kwargs, console_log_level=logging.WARNING)
 
     agent = build_agent(mdp, args, batch_size, privileged)
     if args.init_agent is not None:
@@ -404,29 +296,18 @@ def train(args, seed_dir, dr_params, privileged):
         lin_err, ang_err, falls = dataset_tracking(mdp, dataset)
         alive = 1.0 - falls
         cur = curriculum.state()
-        logger.log_evaluation(
-            epoch,
-            J=J,
-            R=R,
-            entropy=E,
-            mean_ep_len=L,
-            V=V,
-            lin_vel_err=lin_err,
-            ang_vel_err=ang_err,
-            alive_frac=alive,
-            **cur,
-        )
-        line = (
-            f"{time.strftime('%d/%m/%Y %H:%M:%S')} [INFO] Epoch {epoch} | J: {J} R: {R} entropy: {E} "
-            f"mean_ep_len: {L} V: {V} lin_vel_err: {lin_err} ang_vel_err: {ang_err} alive_frac: {alive} "
-            + " ".join(f"{k}: {v}" for k, v in cur.items())
-        )
+        logger.log_evaluation(epoch, J=J, R=R, entropy=E, mean_ep_len=L, V=V, lin_vel_err=lin_err,
+                              ang_vel_err=ang_err, alive_frac=alive, **cur)
+        line = (f"{time.strftime('%d/%m/%Y %H:%M:%S')} [INFO] Epoch {epoch} | J: {J} R: {R} entropy: {E} "
+                f"mean_ep_len: {L} V: {V} lin_vel_err: {lin_err} ang_vel_err: {ang_err} alive_frac: {alive} "
+                + " ".join(f"{k}: {v}" for k, v in cur.items()))
         log.write(line + "\n")
         log.flush()
         last.update(J=J, epoch=epoch, ep_len=L, lin_err=lin_err, alive=alive)
+        agent.save(str(seed_dir / "walk_last.msh"))
         # Returns from before the schedule is complete are not comparable
-        # with the ones after it (the penalties are still growing), so the
-        # best checkpoint is only tracked once it is.
+        # with the ones after it (the commands get harder), so the best
+        # checkpoint is only tracked once it is.
         if curriculum.complete:
             logger.log_best_agent(agent, J)
             if J >= best["J"]:  # the logger saves on >= too
@@ -443,24 +324,21 @@ def train(args, seed_dir, dr_params, privileged):
     out = seed_dir / "walk.msh"
     status = "ok"
     if "epoch" in best:
-        ckpts = sorted(
-            (seed_dir / "logs").rglob("agent*-best.msh"), key=os.path.getmtime
-        )
+        ckpts = sorted((seed_dir / "logs").rglob("agent*-best.msh"), key=os.path.getmtime)
         if not ckpts:
             raise SystemExit("no checkpoint saved")
         shutil.copy(ckpts[-1], out)
     else:
-        # The schedule never completed, so no best checkpoint was tracked.
+        # No evaluation ran after the schedule completed, so no best
+        # checkpoint was tracked.
         best = last
         agent.save(str(out))
-        status = f"schedule incomplete (penalty scale {mdp.penalty_scale:.3f}): last agent kept"
+        status = "schedule incomplete: last agent kept"
     (seed_dir / "walk.best").write_text(
         f"{best['epoch']} {best['J']} {best['ep_len']} {best['lin_err']} {best['alive']}\n"
     )
-    print(
-        f"[curriculum] done ({status}): epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
-        f"lin_vel_err={best['lin_err']:.3f} alive={best['alive']:.3f} -> {out}"
-    )
+    print(f"[curriculum] done ({status}): epoch {best['epoch']} J={best['J']:.3f} ep_len={best['ep_len']:.1f} "
+          f"lin_vel_err={best['lin_err']:.3f} alive={best['alive']:.3f} -> {out}")
 
     logger.finish()
     mdp.stop()
@@ -471,122 +349,60 @@ def train(args, seed_dir, dr_params, privileged):
 # Main
 # ----------------------------------------------------------------------
 
-
 def parse_args():
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--seed", type=int, required=True)
-    p.add_argument(
-        "--run-dir",
-        default="runs/h2_curriculum",
-        help="sweep folder; this seed goes to seed_<seed>/",
-    )
+    p.add_argument("--run-dir", default="runs/h2_curriculum", help="sweep folder; this seed goes to seed_<seed>/")
     p.add_argument("--epochs", type=int, default=EPOCHS)
     p.add_argument("--init-agent", default=None, help="checkpoint to warm-start from")
-    p.add_argument(
-        "--reset-std",
-        type=float,
-        default=None,
-        help="policy std to reset to after a warm start (default: keep the checkpoint's)",
-    )
-    p.add_argument(
-        "--env-arg",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
-        help="H2Walk constructor argument (Python literal), e.g. --env-arg obs_noise=False or "
-        "--env-arg \"reward_weights={'feet_phase': 3.0}\"",
-    )
+    p.add_argument("--reset-std", type=float, default=None,
+                   help="policy std to reset to after a warm start (default: keep the checkpoint's)")
+    p.add_argument("--env-arg", action="append", default=[], metavar="KEY=VALUE",
+                   help="H2Walk constructor argument (Python literal), e.g. --env-arg obs_noise=False or "
+                        "--env-arg \"reward_weights={'foot_gait': 1.0}\"")
 
     g = p.add_argument_group("domain randomization")
-    g.add_argument(
-        "--no-dr",
-        action="store_true",
-        help="nothing random at all: nominal model, no pushes, no reset noise, no latency",
-    )
-    g.add_argument(
-        "--old-dr",
-        action="store_true",
-        help="only what the old H2Base randomized: pushes and reset noise on the nominal model",
-    )
-    g.add_argument(
-        "--dr",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
-        help="override a DR_DEFAULTS entry, e.g. --dr position_offset=0.01 or --dr max_delay=0.01 "
-        "(seconds); applied after --old-dr",
-    )
-    g.add_argument(
-        "--no-curriculum",
-        action="store_true",
-        help="final command ranges, delay, tracking sigma and penalty scale from the first update",
-    )
-    g.add_argument(
-        "--privileged",
-        nargs="*",
-        default=list(DEFAULT_PRIVILEGED),
-        help="observation entries only the critic sees (names from H2Walk.observation_indices, "
-        "e.g. actual_delay joint_calib_offset base_lin_vel); pass none for a symmetric agent",
-    )
+    g.add_argument("--no-dr", action="store_true",
+                   help="nothing random at all: nominal model, no pushes, no reset yaw")
+    g.add_argument("--dr", action="append", default=[], metavar="KEY=VALUE",
+                   help="override a DR_DEFAULTS entry or any other RandomizationParams field, "
+                        "e.g. --dr position_offset=0.03 or --dr push_max_velocity=1.0")
+    g.add_argument("--no-curriculum", action="store_true", help="full command ranges from the first update")
+    g.add_argument("--privileged", nargs="*", default=list(DEFAULT_PRIVILEGED),
+                   help="observation entries only the critic sees (names from H2Walk.observation_indices); "
+                        "pass none for a symmetric agent")
 
     g = p.add_argument_group("algorithm")
-    g.add_argument(
-        "--alg",
-        choices=("rudin", "ppo"),
-        default="ppo",
-        help="plain PPO, or RudinPPO (adaptive learning rate from the policy KL, gradient clipping)",
-    )
-    g.add_argument(
-        "--history-length",
-        type=int,
-        default=1,
-        help="stacked observations the networks read",
-    )
+    g.add_argument("--alg", choices=("rudin", "ppo"), default="rudin",
+                   help="RudinPPO (adaptive learning rate from the policy KL, gradient clipping), or plain PPO")
+    g.add_argument("--history-length", type=int, default=1, help="stacked observations the networks read")
     g.add_argument("--n-envs", type=int, default=4096)
-    g.add_argument(
-        "--fragment-length",
-        type=int,
-        default=24,
-        help="on-policy steps per environment per fit",
-    )
+    g.add_argument("--fragment-length", type=int, default=24, help="on-policy steps per environment per fit")
     g.add_argument("--fits-per-epoch", type=int, default=10)
-    g.add_argument("--n-minibatches", type=int, default=16)
+    g.add_argument("--n-minibatches", type=int, default=4)
     g.add_argument("--n-epochs-policy", type=int, default=5)
-    g.add_argument(
-        "--n-epochs-critic",
-        type=int,
-        default=1,
-        help="critic passes per fit; 1 was clearly better than 10 on the H2 under domain randomization",
-    )
+    g.add_argument("--n-epochs-critic", type=int, default=5)
     g.add_argument("--n-episodes-test", type=int, default=256)
-    g.add_argument(
-        "--eval-every",
-        type=int,
-        default=1,
-        help="evaluate (and consider for the best checkpoint) every N epochs, and at the last",
-    )
-    g.add_argument("--actor-lr", type=float, default=3e-4)
-    g.add_argument("--critic-lr", type=float, default=3e-4)
+    g.add_argument("--eval-every", type=int, default=20,
+                   help="evaluate (and consider for the best checkpoint) every N epochs, and at the last")
+    g.add_argument("--actor-lr", type=float, default=1e-3)
+    g.add_argument("--critic-lr", type=float, default=1e-3)
     g.add_argument("--desired-kl", type=float, default=0.01)
     g.add_argument("--clip-grad-norm", type=float, default=1.0)
     g.add_argument("--eps-ppo", type=float, default=0.2)
     g.add_argument("--lam", type=float, default=0.95)
-    g.add_argument("--std-0", type=float, default=0.3)
-    g.add_argument("--ent-coeff", type=float, default=0.005)
+    g.add_argument("--std-0", type=float, default=1.0)
+    g.add_argument("--ent-coeff", type=float, default=0.01)
     g.add_argument("--n-features", type=int, nargs="+", default=[512, 256, 128])
     g.add_argument("--critic-features", type=int, nargs="+", default=[512, 256, 128])
-    g.add_argument("--activation", default="relu")
-    g.add_argument("--gain-scale", type=float, default=1.0)
+    g.add_argument("--activation", default="elu")
+    g.add_argument("--gain-scale", type=float, default=0.5)
     g.add_argument("--no-fused-adam", action="store_false", dest="fused_adam")
 
     g = p.add_argument_group("compute")
-    g.add_argument(
-        "--tf32",
-        action="store_true",
-        help="run the matrix multiplications of the networks in TF32 on the tensor cores",
-    )
+    g.add_argument("--device", default="cuda:0", help="cuda:0, or cpu for a slow smoke test without a GPU")
+    g.add_argument("--tf32", action="store_true",
+                   help="run the matrix multiplications of the networks in TF32 on the tensor cores")
     g.add_argument("--no-graph-capture", action="store_false", dest="graph_capture")
     g.add_argument("--no-wandb", action="store_false", dest="wandb")
     g.add_argument("--wandb-project", default="mushroom_rl_h2")
@@ -595,8 +411,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    assert torch.cuda.is_available(), "MuJoCo Warp requires a CUDA device."
-    TorchUtils.set_default_device("cuda:0")
+    if args.device == "cpu":
+        args.graph_capture = False
+        args.fused_adam = False
+    else:
+        assert torch.cuda.is_available(), "no CUDA device; pass --device cpu for a smoke test"
+    TorchUtils.set_default_device(args.device)
 
     if args.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -604,46 +424,32 @@ def main():
         torch.set_float32_matmul_precision("high")
 
     dr_params = dict(DR_DEFAULTS)
-    if args.old_dr:
-        dr_params.update(OLD_DR)
     dr_params.update(parse_kv(args.dr))
-    unknown = set(dr_params) - set(DR_DEFAULTS) - set(RandomizationParams().as_dict())
+    unknown = set(dr_params) - set(RandomizationParams().as_dict())
     if unknown:
         raise SystemExit(f"unknown --dr entries: {sorted(unknown)}")
     if "max_delay_steps" in dr_params:
-        raise SystemExit(
-            "the latency is given in seconds: --dr max_delay=0.02, not max_delay_steps"
-        )
+        raise SystemExit("the latency is given in seconds: --dr max_delay=0.02, not max_delay_steps")
     privileged = tuple(n for n in args.privileged if n.lower() != "none")
 
     run_dir = Path(args.run_dir)
     seed_dir = run_dir / f"seed_{args.seed}"
     seed_dir.mkdir(parents=True, exist_ok=True)
-    git = (
-        subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).resolve().parent,
-        ).stdout.strip()
-        or "unknown"
-    )
-    config_text = "\n".join(
-        [
-            f"alg={args.alg} history_length={args.history_length} tf32={args.tf32} init_agent={args.init_agent}",
-            f"epochs={args.epochs} fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs} "
-            f"n_epochs_critic={args.n_epochs_critic}",
-            f"domain_randomization={not args.no_dr} old_dr={args.old_dr} curriculum_enabled={not args.no_curriculum} "
-            f"dr_params={dr_params} pushes={PUSHES}",
-            f"privileged={list(privileged)}",
-            f"env_arg={args.env_arg}",
-            f"curriculum={CURRICULUM}",
-            f"penalty_curriculum={PENALTY_CURRICULUM}",
-            f"std_0={args.std_0} ent_coeff={args.ent_coeff} actor_lr={args.actor_lr} critic_lr={args.critic_lr}",
-            f"git={git}",
-            "",
-        ]
-    )
+    git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                         cwd=Path(__file__).resolve().parent).stdout.strip() or "unknown"
+    config_text = "\n".join([
+        f"alg={args.alg} history_length={args.history_length} tf32={args.tf32} init_agent={args.init_agent}",
+        f"epochs={args.epochs} fits_per_epoch={args.fits_per_epoch} n_envs={args.n_envs} "
+        f"n_minibatches={args.n_minibatches} n_epochs_policy={args.n_epochs_policy} "
+        f"n_epochs_critic={args.n_epochs_critic}",
+        f"domain_randomization={not args.no_dr} curriculum_enabled={not args.no_curriculum} dr_params={dr_params}",
+        f"privileged={list(privileged)}",
+        f"env_arg={args.env_arg}",
+        f"curriculum={CURRICULUM}",
+        f"std_0={args.std_0} ent_coeff={args.ent_coeff} actor_lr={args.actor_lr} critic_lr={args.critic_lr} "
+        f"activation={args.activation} n_features={args.n_features} critic_features={args.critic_features}",
+        f"git={git}", "",
+    ])
     # One per seed, always (a reused --run-dir would otherwise keep the first
     # run's settings), and one for the run folder if it has none yet.
     (seed_dir / "config.txt").write_text(config_text)

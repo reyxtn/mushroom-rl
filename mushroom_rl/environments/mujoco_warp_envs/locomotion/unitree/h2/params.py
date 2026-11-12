@@ -103,6 +103,7 @@ REWARD_TERMS = (
     "body_ang_vel",
     "angular_momentum",
     "is_terminated",
+    "alive",
     "joint_acc_l2",
     "joint_pos_limits",
     "action_rate_l2",
@@ -115,6 +116,7 @@ REWARD_TERMS = (
     "stand_still_base_vel",
     "stand_still_com",
     "stand_still_feet",
+    "stand_still_orientation",
     "self_collisions",
 )
 
@@ -126,6 +128,8 @@ DEFAULT_REWARD_WEIGHTS = dict(
     body_ang_vel=-0.05,
     angular_momentum=-0.025,
     is_terminated=-200.0,
+    # Not in Unitree's H2 task: a constant reward for every step the robot is up. Their G1 task uses 0.15.
+    alive=0.0,
     joint_acc_l2=-2.5e-7,
     joint_pos_limits=-10.0,
     action_rate_l2=-0.05,
@@ -141,6 +145,8 @@ DEFAULT_REWARD_WEIGHTS = dict(
     stand_still_com=0.0,
     # Feet off the floor while commanded to stand.
     stand_still_feet=0.0,
+    # Torso tilt while commanded to stand, so walking keeps its lean.
+    stand_still_orientation=0.0,
     self_collisions=-1.0,
 )
 

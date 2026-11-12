@@ -349,6 +349,7 @@ class H2Walk(H2Base):
                                      + torch.sum(torch.square(ang_vel), dim=1)) * (1.0 - moving),
             "stand_still_com": self._com_offset() * (1.0 - moving),
             "stand_still_feet": torch.sum((~contact).float(), dim=1) * (1.0 - moving),
+            "stand_still_orientation": torch.sum(torch.square(self._torso_projected_gravity()[:, :2]), dim=1) * (1.0 - moving),
             "self_collisions": self._self_collisions,
         }
         r = {name: value * w[name] * dt for name, value in r.items()}
@@ -360,7 +361,8 @@ class H2Walk(H2Base):
         total = torch.nan_to_num(sum(r.values()), nan=0.0, posinf=0.0, neginf=floor)
         total = torch.clamp(total, min=floor)
         r["is_terminated"] = absorbing.float() * w["is_terminated"] * dt
-        total = total + r["is_terminated"]
+        r["alive"] = (1.0 - absorbing.float()) * w["alive"] * dt
+        total = total + r["is_terminated"] + r["alive"]
 
         self._reward_info = r
         self._last_actions = actions.clone()

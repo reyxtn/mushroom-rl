@@ -208,7 +208,7 @@ WALK_COMMAND_GENERATOR = dict(
     heading_control_stiffness=0.5,
     rel_heading_envs=1.0,
     rel_standing_envs=0.3,
-    frac_low_speed_envs=0.2,
+    frac_low_speed_envs=0.0,
     low_speed_threshold=0.5,
 )
 

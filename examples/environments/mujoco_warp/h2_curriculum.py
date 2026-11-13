@@ -77,7 +77,7 @@ CURRICULUM = dict(
     command_steps=(0.5,),
     command_ranges=[
         dict(lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.5, 0.5)),
-        dict(lin_vel_x=(-1.0, 2.0), lin_vel_y=(-1.0, 1.0)),
+        dict(lin_vel_x=(-0.5, 1.0), lin_vel_y=(-0.5, 0.5)),
     ],
     delays=[0.0, 0.0],
 )

@@ -117,6 +117,7 @@ REWARD_TERMS = (
     "stand_still_com",
     "stand_still_feet",
     "stand_still_orientation",
+    "stand_still_action_rate",
     "self_collisions",
 )
 
@@ -147,6 +148,8 @@ DEFAULT_REWARD_WEIGHTS = dict(
     stand_still_feet=0.0,
     # Torso tilt while commanded to stand, so walking keeps its lean.
     stand_still_orientation=0.0,
+    # Change of the action while commanded to stand.
+    stand_still_action_rate=0.0,
     self_collisions=-1.0,
 )
 

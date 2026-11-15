@@ -3,6 +3,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from helper.cases import needs_cuda
+
 from mushroom_rl.policy import RecurrentGaussianTorchPolicy
 from mushroom_rl.policy.stateful_torch_policy import StatefulTorchPolicy
 from mushroom_rl.approximators.parametric.networks import RecurrentNetwork
@@ -11,8 +13,7 @@ from mushroom_rl.approximators.parametric.networks import RecurrentNetwork
 class SimpleGRUNetwork(RecurrentNetwork):
     returns_policy_state = True
 
-    def __init__(self, input_shape, output_shape, rnn_type='gru', n_hidden_features=8,
-                 num_hidden_layers=1, **kwargs):
+    def __init__(self, input_shape, output_shape, rnn_type='gru', n_hidden_features=8, num_hidden_layers=1, **kwargs):
         super().__init__()
         assert isinstance(output_shape, list) and len(output_shape) == 2
         self._rnn = nn.GRU(input_shape[0], n_hidden_features, batch_first=True)
@@ -23,6 +24,13 @@ class SimpleGRUNetwork(RecurrentNetwork):
         out, next_hidden = self._rnn(state.float(), hidden_state)
 
         return self._fc(self._select_by_length(out, lengths)), self._merge_policy_state(next_hidden)
+
+
+class FlatGRUNetwork(SimpleGRUNetwork):
+    def forward(self, state, policy_state, lengths, **kwargs):
+        mu, next_policy_state = super().forward(state, policy_state, lengths)
+
+        return mu[..., 0], next_policy_state
 
 
 def make_policy(n_state=4, n_action=2, n_hidden=8):
@@ -100,6 +108,24 @@ def test_draw_action():
     assert torch.allclose(new_policy_state, new_ps_test, atol=1e-5)
 
 
+@needs_cuda()
+def test_draw_action_cuda():
+    torch.manual_seed(42)
+    policy = RecurrentGaussianTorchPolicy(network=SimpleGRUNetwork, input_shape=(4,), output_shape=(2,),
+                                          rnn_type='gru', n_hidden_features=8, device='cuda')
+    state = torch.tensor([0.1, -0.2, 0.3, -0.4], device='cuda')
+    policy.reset()
+    policy.draw_action(state)
+
+    torch.cuda.set_sync_debug_mode('error')
+    try:
+        action = policy.draw_action(state)
+    finally:
+        torch.cuda.set_sync_debug_mode('default')
+
+    assert action.device.type == 'cuda'
+
+
 def test_distribution():
     policy = make_policy()
 
@@ -108,6 +134,10 @@ def test_distribution():
     assert isinstance(entropy, torch.Tensor)
     assert entropy.shape == ()
     assert torch.isclose(entropy, torch.tensor(2.837877), atol=1e-5)
+
+    policy._log_sigma.data = torch.tensor([-25., 3.])
+
+    assert torch.isclose(policy.entropy(), torch.tensor(2.837877 - 18.), atol=1e-5)
 
     n_state, n_action, n_hidden = 4, 2, 8
     policy = make_policy(n_state, n_action, n_hidden)
@@ -119,8 +149,9 @@ def test_distribution():
 
     dist, new_ps = policy.distribution_and_policy_state(state, policy_state, lengths)
 
-    assert isinstance(dist, torch.distributions.MultivariateNormal)
-    assert dist.loc.shape == (batch, n_action)
+    assert isinstance(dist, torch.distributions.Independent)
+    assert isinstance(dist.base_dist, torch.distributions.Normal)
+    assert dist.mean.shape == (batch, n_action)
     assert new_ps.shape == (batch, 1, n_hidden)
     assert not torch.all(new_ps == 0.0)
 
@@ -154,7 +185,7 @@ def test_distribution():
     action, log_prob, next_policy_state = policy.draw_with_log_prob(state, policy_state, lengths)
 
     action_test = torch.tensor(np.load('tests/policy/data/test_distribution.npy'))
-    log_prob_test = torch.tensor([-1.9028531, -1.8918899, -2.4856393])
+    log_prob_test = torch.tensor([-1.9028533, -1.89189, -2.4856393])
 
     assert action.shape == (batch, n_action)
     assert log_prob.shape == (batch,)
@@ -173,8 +204,17 @@ def test_distribution():
 
     dist = policy.distribution(state, policy_state, lengths)
 
-    assert isinstance(dist, torch.distributions.MultivariateNormal)
-    assert dist.loc.shape == (batch, n_action)
+    assert isinstance(dist, torch.distributions.Independent)
+    assert isinstance(dist.base_dist, torch.distributions.Normal)
+    assert dist.mean.shape == (batch, n_action)
+
+    with pytest.raises(AssertionError):
+        policy.log_prob(state, torch.zeros(batch), policy_state, lengths)
+
+    flat_policy = RecurrentGaussianTorchPolicy(network=FlatGRUNetwork, input_shape=(n_state,), output_shape=(1,),
+                                               rnn_type='gru', n_hidden_features=n_hidden)
+    with pytest.raises(AssertionError):
+        flat_policy.distribution(state, policy_state, lengths)
 
 
 def test_weights():
@@ -185,8 +225,43 @@ def test_weights():
 
     assert torch.equal(policy.get_weights(), weights)
 
+    expected = weights.clone()
+    weights += 1.
+
+    assert torch.equal(policy.get_weights(), expected)
+
     for call in (lambda: StatefulTorchPolicy.draw_with_log_prob(policy, None, None),
                  lambda: StatefulTorchPolicy.log_prob(policy, None, None, None),
                  lambda: StatefulTorchPolicy.distribution(policy, None, None)):
         with pytest.raises(NotImplementedError):
             call()
+
+
+def test_validate_args():
+    state = torch.zeros(2, 1, 4)
+    policy_state = torch.zeros(2, 1, 8)
+    lengths = torch.ones(2, dtype=torch.long)
+
+    policy = make_policy()
+    policy._log_sigma.data = torch.tensor([float('nan'), 0.])
+
+    assert torch.isnan(policy.distribution(state, policy_state, lengths).stddev[:, 0]).all()
+
+    policy = RecurrentGaussianTorchPolicy(network=SimpleGRUNetwork, input_shape=(4,), output_shape=(2,),
+                                          rnn_type='gru', n_hidden_features=8, validate_args=True)
+    policy._log_sigma.data = torch.tensor([float('nan'), 0.])
+
+    with pytest.raises(ValueError):
+        policy.distribution(state, policy_state, lengths)
+
+
+def test_mean():
+    policy = make_policy()
+    state = torch.zeros(3, 1, 4)
+    policy_state = torch.zeros(3, 1, 8)
+    lengths = torch.ones(3, dtype=torch.long)
+
+    mean = policy.mean(state, policy_state, lengths)
+
+    assert mean.shape == (3, 2) and mean.requires_grad
+    assert torch.equal(mean, policy.distribution(state, policy_state, lengths).mean)

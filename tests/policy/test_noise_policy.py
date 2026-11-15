@@ -175,3 +175,36 @@ def test_clipped_gaussian(tmpdir):
         pi.draw_action(torch.randn(5))
 
     assert np.allclose(std.get_value(), np.array([1., .5]))
+
+
+def test_validate_args():
+    state = torch.full((5,), float('nan'))
+    mu = TorchApproximator(network=LinearNetwork, input_shape=(5,), output_shape=(2,))
+
+    pi = ClippedGaussianPolicy(mu, torch.eye(2), -torch.ones(2), torch.ones(2))
+
+    assert torch.isnan(pi.draw_action(state)).all()
+
+    pi = ClippedGaussianPolicy(mu, torch.eye(2), -torch.ones(2), torch.ones(2), validate_args=True)
+
+    with pytest.raises(ValueError):
+        pi.draw_action(state)
+
+
+def test_location():
+    torch.manual_seed(1)
+    mu = TorchApproximator(network=LinearNetwork, input_shape=(5,), output_shape=(2,))
+    state = torch.randn(4, 5)
+
+    ou = OrnsteinUhlenbeckPolicy(mu, sigma=torch.ones(2) * .2, theta=.15, dt=1e-2)
+    clipped = ClippedGaussianPolicy(mu, torch.eye(2), -1e-3 * torch.ones(2), 1e-3 * torch.ones(2))
+
+    for pi in [ou, clipped]:
+        assert pi.location(state).requires_grad and torch.equal(pi.location(state), mu(state))
+        assert list(pi.parameters()) == list(mu.parameters())
+
+    ou.reset()
+
+    assert torch.equal(ou.draw_action_greedy(state), mu(state))
+    assert torch.equal(clipped.draw_action_greedy(state[0]), torch.clip(mu(state[0]), -1e-3, 1e-3))
+    assert not torch.equal(clipped.draw_action_greedy(state[0]), clipped.location(state[0]))

@@ -6,9 +6,10 @@ import numpy as np
 import pytest
 
 from helper.cases import needs_cuda
+from helper.utils import TestUtils as tu
 
-from mushroom_rl.policy.torch_policy import TorchPolicy, GaussianTorchPolicy, BoltzmannTorchPolicy, \
-    SquashedGaussianTorchPolicy
+from mushroom_rl.policy.torch_policy import TorchPolicy, GaussianTorchPolicy, CholeskyGaussianTorchPolicy, \
+    BoltzmannTorchPolicy, SquashedGaussianTorchPolicy
 from mushroom_rl.approximators.parametric import TorchApproximator
 from mushroom_rl.rl_utils.parameters import Parameter, LinearParameter
 
@@ -39,6 +40,11 @@ class Network(nn.Module):
         a = self._h3(features2)
 
         return a
+
+
+class FlatNetwork(Network):
+    def forward(self, state, **kwargs):
+        return super().forward(state)[..., 0]
 
 
 class HistoryNetwork(Network):
@@ -90,6 +96,57 @@ def test_gaussian():
     assert torch.allclose(action, pi.distribution(state).mean)
     assert torch.allclose(action, pi.draw_action_greedy(state))
 
+    with pytest.raises(AssertionError):
+        GaussianTorchPolicy(Network, (3,), (1,), n_features=50).log_prob(state, torch.zeros(4))
+    with pytest.raises(AssertionError):
+        GaussianTorchPolicy(FlatNetwork, (3,), (1,), n_features=50).distribution(state)
+
+
+def test_cholesky_gaussian(tmpdir):
+    torch.manual_seed(42)
+    pi = CholeskyGaussianTorchPolicy(Network, (3,), (3,), std_0=.5, n_features=50)
+    state = torch.rand(4, 3)
+
+    assert torch.allclose(pi.distribution(state).scale_tril, (torch.eye(3) * .5).expand(4, 3, 3))
+
+    n_weights = len(pi.get_weights())
+    weights = torch.arange(n_weights, dtype=torch.float32) / n_weights
+    pi.set_weights(weights)
+    log_diagonal, off_diagonal = weights[-6:-3], weights[-3:]
+    target = torch.tensor([[log_diagonal[0].exp(), 0., 0.],
+                           [off_diagonal[0], log_diagonal[1].exp(), 0.],
+                           [off_diagonal[1], off_diagonal[2], log_diagonal[2].exp()]])
+    dist = pi.distribution(state)
+    action, log_prob = pi.draw_with_log_prob(state)
+    pi.log_prob(state, action.detach()).sum().backward()
+    torch.manual_seed(1)
+    drawn = pi.draw_action(state)
+    torch.manual_seed(1)
+    sampled = dist.sample()
+
+    assert n_weights == len(pi._mu.get_weights()) + 6
+    assert torch.equal(pi.get_weights(), weights)
+    assert type(dist) is torch.distributions.MultivariateNormal
+    assert torch.allclose(dist.scale_tril, target.expand(4, 3, 3))
+    assert torch.isclose(pi.entropy(), dist.entropy()[0])
+    assert torch.allclose(log_prob, pi.log_prob(state, action.detach()))
+    assert len(list(pi.parameters())) == len(list(pi._mu.parameters())) + 2
+    assert torch.all(pi._chol_off_diagonal.grad != 0)
+    assert torch.equal(drawn, sampled)
+    assert action.requires_grad and log_prob.requires_grad
+    assert torch.equal(pi.draw_action_greedy(state), dist.mean)
+
+    tu.assert_save_load(pi, tmpdir / 'policy.msh')
+
+    pi = CholeskyGaussianTorchPolicy(Network, (3,), (1,), n_features=50)
+    weights = torch.ones(len(pi.get_weights()))
+    pi.set_weights(weights)
+    weights.zero_()
+
+    assert len(weights) == len(pi._mu.get_weights()) + 1
+    assert torch.equal(pi.get_weights(), torch.ones_like(weights))
+    assert torch.allclose(pi.distribution(state).scale_tril, torch.tensor([[torch.e]]).expand(4, 1, 1))
+
 
 def test_boltzmann():
     np.random.seed(42)
@@ -122,7 +179,7 @@ def test_boltzmann():
 
     action = pi.draw_action_greedy(state)
     assert action.shape == (3, 1)
-    assert torch.equal(action, pi.distribution(state).mode.unsqueeze(-1))
+    assert torch.equal(action, pi.distribution(state).mode)
     assert torch.equal(action, pi.draw_action_greedy(state))
 
     np.random.seed(42)
@@ -143,6 +200,17 @@ def test_boltzmann():
         pi.draw_action(state)
 
     assert np.allclose(beta.get_value(), 4.6)
+
+
+def make_policies(validate_args):
+    mu_approximator = TorchApproximator(input_shape=(3,), output_shape=(2,), network=Network, n_features=50)
+    sigma_approximator = TorchApproximator(input_shape=(3,), output_shape=(2,), network=Network, n_features=50)
+
+    return [GaussianTorchPolicy(Network, (3,), (2,), n_features=50, validate_args=validate_args),
+            CholeskyGaussianTorchPolicy(Network, (3,), (2,), n_features=50, validate_args=validate_args),
+            BoltzmannTorchPolicy(Network, (3,), (2,), 1., n_features=50, validate_args=validate_args),
+            SquashedGaussianTorchPolicy(mu_approximator, sigma_approximator, np.array([-2., -2.]), np.array([2., 2.]),
+                                        -20, 2, validate_args=validate_args)]
 
 
 def test_squashed_gaussian():
@@ -246,6 +314,17 @@ def test_gaussian_to_device():
     assert {p.device.type for p in pi.parameters()} == {'cuda'}
     assert pi.draw_action(torch.ones(3, device='cuda'))[0].device.type == 'cuda'
 
+    torch.cuda.set_sync_debug_mode('error')
+    try:
+        pi.draw_action(torch.ones(4, 3, device='cuda'))
+    finally:
+        torch.cuda.set_sync_debug_mode('default')
+
+    cholesky = CholeskyGaussianTorchPolicy(Network, (3,), (3,), n_features=50, device='cpu').to('cuda')
+
+    assert cholesky._tril_indices.device.type == 'cuda'
+    assert cholesky.draw_action(torch.ones(4, 3, device='cuda')).device.type == 'cuda'
+
 
 def test_weights():
     torch.manual_seed(1)
@@ -254,6 +333,7 @@ def test_weights():
     action, log_prob = gaussian.draw_with_log_prob(state)
 
     assert action.shape == (4, 2) and log_prob.shape == (4,)
+    assert action.requires_grad and log_prob.requires_grad
     assert torch.allclose(log_prob, gaussian.log_prob(state, action.detach()))
 
     boltzmann = BoltzmannTorchPolicy(Network, (3,), (2,), Parameter(1.), n_features=50)
@@ -273,3 +353,39 @@ def test_weights():
     squashed.set_weights(weights)
 
     assert torch.equal(squashed.get_weights(), weights)
+
+
+def test_validate_args(tmpdir):
+    state = torch.full((2, 3), float('nan'))
+    action = torch.zeros(2, 2)
+    discrete_action = torch.zeros(2, 1, dtype=torch.long)
+
+    gaussian, cholesky, boltzmann, squashed = make_policies(validate_args=False)
+
+    assert torch.isnan(gaussian.distribution(state).log_prob(action)).all()
+    assert torch.isnan(cholesky.distribution(state).log_prob(action)).all()
+    assert torch.isnan(boltzmann.distribution(state).log_prob(discrete_action)).all()
+    assert torch.isnan(squashed.distribution(state).log_prob(action)).all()
+
+    for pi in make_policies(validate_args=True):
+        with pytest.raises(ValueError):
+            pi.distribution(state)
+
+    tu.assert_save_load(pi, tmpdir / 'policy.msh')
+
+
+def test_location():
+    torch.manual_seed(42)
+    state = torch.rand(4, 3)
+
+    gaussian, cholesky, _, squashed = make_policies(validate_args=False)
+
+    for pi in [gaussian, cholesky, squashed]:
+        action = pi.location(state)
+
+        assert action.shape == (4, 2) and action.requires_grad
+        assert torch.equal(action, pi.draw_action_greedy(state))
+
+    assert torch.equal(gaussian.location(state), gaussian.distribution(state).mean)
+    assert torch.equal(cholesky.location(state), cholesky.distribution(state).mean)
+    assert torch.allclose(squashed.location(state), squashed.distribution(state).median)

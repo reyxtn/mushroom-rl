@@ -10,20 +10,26 @@ class AbstractGaussianTorchDistribution(Distribution):
 
     """
 
-    def __init__(self, context_shape=None, device=None):
+    def __init__(self, context_shape=None, device=None, validate_args=False):
         """
         Constructor.
 
         Args:
             context_shape (Tuple): shape of the context variable;
-            device (str, None): device the distribution parameters are stored on, or ``None`` for the default one.
+            device (str, None): device the distribution parameters are stored on, or ``None`` for the default one;
+            validate_args (bool, False): whether the distribution validates its parameters and the values passed to
+                ``log_pdf``.
 
         """
         super().__init__(context_shape, 'torch', device)
 
+        self._validate_args = validate_args
+
+        self._add_save_attr(_validate_args='primitive')
+
     def distribution(self, context=None):
         mu, chol_sigma = self._get_mean_and_chol(context)
-        return torch.distributions.MultivariateNormal(loc=mu, scale_tril=chol_sigma, validate_args=False)
+        return torch.distributions.MultivariateNormal(loc=mu, scale_tril=chol_sigma, validate_args=self._validate_args)
 
     def sample(self, context=None):
         dist = self.distribution(context)
@@ -62,10 +68,10 @@ class AbstractGaussianTorchDistribution(Distribution):
 
 
 class DiagonalGaussianTorchDistribution(AbstractGaussianTorchDistribution):
-    def __init__(self, mu, sigma, device=None):
-        super().__init__(device=device)
+    def __init__(self, mu, sigma, device=None, validate_args=False):
+        super().__init__(device=device, validate_args=validate_args)
 
-        self._mu = torch.nn.Parameter(mu.to(self._device))
+        self._mu = torch.nn.Parameter(mu.to(self._device, copy=True))
         self._log_sigma = torch.nn.Parameter(torch.log(sigma.to(self._device)))
 
         self._add_save_attr(
@@ -84,8 +90,8 @@ class DiagonalGaussianTorchDistribution(AbstractGaussianTorchDistribution):
 
     def set_parameters(self, rho):
         n_dims = len(self._mu)
-        self._mu.data = rho[:n_dims]
-        self._log_sigma.data = rho[n_dims:]
+        self._mu.data.copy_(rho[:n_dims])
+        self._log_sigma.data.copy_(rho[n_dims:])
 
     @property
     def parameters_size(self):
@@ -99,12 +105,12 @@ class DiagonalGaussianTorchDistribution(AbstractGaussianTorchDistribution):
 
 
 class CholeskyGaussianTorchDistribution(AbstractGaussianTorchDistribution):
-    def __init__(self, mu, sigma, device=None):
-        super().__init__(device=device)
+    def __init__(self, mu, sigma, device=None, validate_args=False):
+        super().__init__(device=device, validate_args=validate_args)
 
         chol_sigma = torch.linalg.cholesky(sigma.to(self._device))
 
-        self._mu = torch.nn.Parameter(mu.to(self._device))
+        self._mu = torch.nn.Parameter(mu.to(self._device, copy=True))
         self._chol_sigma = torch.nn.Parameter(chol_sigma)
 
         self._add_save_attr(
@@ -125,8 +131,8 @@ class CholeskyGaussianTorchDistribution(AbstractGaussianTorchDistribution):
     def set_parameters(self, rho):
         n_dims = len(self._mu)
         tril_indices = torch.tril_indices(row=n_dims, col=n_dims)
-        self._mu.data = rho[:n_dims]
-        self._chol_sigma.data[tril_indices[0], tril_indices[1]] = rho[n_dims:]
+        self._mu.data.copy_(rho[:n_dims])
+        self._chol_sigma.data[tril_indices[0], tril_indices[1]] = rho[n_dims:].to(self._chol_sigma)
 
     @property
     def parameters_size(self):

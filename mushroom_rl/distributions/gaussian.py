@@ -19,8 +19,8 @@ class GaussianDistribution(Distribution):
             sigma (np.ndarray): covariance matrix of the distribution.
 
         """
-        self._mu = mu
-        self._sigma = sigma
+        self._mu = mu.copy()
+        self._sigma = sigma.copy()
         self._inv_sigma = np.linalg.inv(sigma)
 
         super().__init__()
@@ -81,10 +81,10 @@ class GaussianDistribution(Distribution):
         return g
 
     def get_parameters(self):
-        return self._mu
+        return self._mu.copy()
 
     def set_parameters(self, rho):
-        self._mu = rho
+        self._mu[:] = rho
 
         self._log()
 
@@ -102,8 +102,7 @@ class GaussianDistribution(Distribution):
         return mu_new
 
     @staticmethod
-    def _kl_constraint(mu, mu_new, sigma, sigma_new, sigma_inv, sigma_new_inv, logdet_sigma, logdet_sigma_new,
-                       n_dims):
+    def _kl_constraint(mu, mu_new, sigma, sigma_new, sigma_inv, sigma_new_inv, logdet_sigma, logdet_sigma_new, n_dims):
 
         return 0.5 * (np.trace(sigma_new_inv @ sigma) - n_dims + logdet_sigma_new - logdet_sigma
                       + (mu_new - mu).T @ sigma_new_inv @ (mu_new - mu))
@@ -152,8 +151,8 @@ class GaussianDiagonalDistribution(Distribution):
 
         """
         assert len(std.shape) == 1
-        self._mu = mu
-        self._std = std
+        self._mu = mu.copy()
+        self._std = std.copy()
 
         super().__init__()
 
@@ -244,8 +243,8 @@ class GaussianDiagonalDistribution(Distribution):
 
     def set_parameters(self, rho):
         n_dims = len(self._mu)
-        self._mu = rho[:n_dims]
-        self._std = rho[n_dims:]
+        self._mu[:] = rho[:n_dims]
+        self._std[:] = rho[n_dims:]
 
         self._log()
 
@@ -324,7 +323,7 @@ class GaussianCholeskyDistribution(Distribution):
             sigma (np.ndarray): initial covariance matrix of the distribution.
 
         """
-        self._mu = mu
+        self._mu = mu.copy()
         self._chol_sigma = np.linalg.cholesky(sigma)
 
         super().__init__()
@@ -427,7 +426,7 @@ class GaussianCholeskyDistribution(Distribution):
 
     def set_parameters(self, rho):
         n_dims = len(self._mu)
-        self._mu = rho[:n_dims]
+        self._mu[:] = rho[:n_dims]
         self._chol_sigma[np.tril_indices(n_dims)] = rho[n_dims:]
 
         self._log()

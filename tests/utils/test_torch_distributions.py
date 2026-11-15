@@ -2,7 +2,7 @@ import torch
 
 import pytest
 
-from mushroom_rl.utils.torch_utils import SquashedGaussian, CategoricalWrapper, DistHelperWrapper
+from mushroom_rl.utils.torch_utils import SquashedGaussian, CategoricalWrapper, DiagonalGaussian, DistHelperWrapper
 
 
 def test_squashed_gaussian():
@@ -96,13 +96,55 @@ def test_squashed_gaussian_log_prob():
 def test_categorical():
     wrapper = CategoricalWrapper(torch.tensor([[0.1, 0.9], [0.8, 0.2]]))
 
-    assert torch.equal(wrapper.mode, torch.tensor([1, 0]))
+    assert torch.equal(wrapper.mode, torch.tensor([[1], [0]]))
+    assert wrapper.sample().shape == (2, 1) and wrapper.entropy().shape == (2,)
+    assert torch.allclose(wrapper.probs, torch.softmax(torch.tensor([[0.1, 0.9], [0.8, 0.2]]), -1))
+    assert torch.allclose(wrapper.logits, torch.log(wrapper.probs))
+    assert type(wrapper.expand((3, 2))) is CategoricalWrapper and wrapper.expand((3, 2)).batch_shape == (3, 2)
 
     wrapper = CategoricalWrapper(torch.tensor([[0.1, 0.9], [0.8, 0.2]]))
     log_prob = wrapper.log_prob(torch.tensor([[1], [0]]))
 
     assert log_prob.shape == (2,)
     assert torch.allclose(log_prob, torch.tensor([-0.37110078, -0.43748802]), atol=1e-6)
+
+    with pytest.raises(AssertionError):
+        wrapper.log_prob(torch.tensor([1, 0]))
+
+
+def test_diagonal_gaussian():
+    loc = torch.tensor([[0., 1.], [2., 3.]])
+    scale = torch.tensor([.5, 2.])
+    action = torch.tensor([[1., -1.], [0., 2.]])
+    dist = DiagonalGaussian(loc, scale)
+    reference = torch.distributions.Independent(torch.distributions.Normal(loc, scale), 1)
+    other_reference = torch.distributions.Independent(torch.distributions.Normal(loc + 1., scale), 1)
+    expanded = dist.expand((3, 2))
+
+    assert dist.batch_shape == (2,) and dist.event_shape == (2,)
+    assert dist.loc is dist.base_dist.loc and dist.scale is dist.base_dist.scale
+    assert torch.equal(dist.loc, loc) and torch.equal(dist.scale, scale.expand(2, 2))
+    assert torch.equal(dist.log_prob(action), reference.log_prob(action))
+    assert torch.equal(torch.distributions.kl_divergence(dist, DiagonalGaussian(loc + 1., scale)),
+                       torch.distributions.kl_divergence(reference, other_reference))
+    assert type(expanded) is DiagonalGaussian and expanded.batch_shape == (3, 2)
+
+
+def test_validate_args():
+    nan = torch.tensor([float('nan'), 0.])
+    low = torch.tensor([-2., -2.])
+    high = torch.tensor([2., 2.])
+
+    assert torch.isnan(SquashedGaussian(nan, torch.ones(2), low, high).median[0])
+    assert torch.isnan(CategoricalWrapper(nan).logits[0])
+    assert torch.isnan(DiagonalGaussian(nan, torch.ones(2)).mean[0])
+
+    with pytest.raises(ValueError):
+        SquashedGaussian(nan, torch.ones(2), low, high, validate_args=True)
+    with pytest.raises(ValueError):
+        CategoricalWrapper(nan, validate_args=True)
+    with pytest.raises(ValueError):
+        DiagonalGaussian(nan, torch.ones(2), validate_args=True)
 
 
 def test_dist_helper():
@@ -128,6 +170,20 @@ def test_dist_helper():
 
     assert torch.allclose(selected.covariance_matrix, covariance[idx], atol=1e-6)
     assert torch.allclose(selected.log_prob(action[idx]), dist.log_prob(action)[idx], atol=1e-6)
+
+    loc = torch.tensor([[0., 1.], [2., 3.], [4., 5.], [6., 7.]])
+    idx = torch.tensor([3, 1])
+    action = torch.tensor([[1., 1.], [-1., 2.], [0., 0.], [3., -3.]])
+    for scale, target_scale in [(torch.tensor([.5, 2.]), torch.tensor([[.5, 2.], [.5, 2.]])),
+                                (torch.arange(1., 9.).reshape(4, 2), torch.tensor([[7., 8.], [3., 4.]]))]:
+        dist = DiagonalGaussian(loc, scale)
+
+        selected = DistHelperWrapper(dist)[idx]
+
+        assert type(selected) is DiagonalGaussian and selected.reinterpreted_batch_ndims == 1
+        assert torch.equal(selected.loc, loc[idx])
+        assert torch.equal(selected.scale, target_scale)
+        assert torch.allclose(selected.log_prob(action[idx]), dist.log_prob(action)[idx], atol=1e-6)
 
     dist = CategoricalWrapper(torch.tensor([[0.1, 0.9, 0.], [0.8, 0.2, 1.], [0., 0., 0.], [2., -1., .5]]))
     idx = torch.tensor([1, 3])

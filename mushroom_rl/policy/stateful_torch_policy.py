@@ -6,7 +6,7 @@ from itertools import chain
 from mushroom_rl.policy.policy import StatefulPolicy
 from mushroom_rl.policy.torch_policy import TorchPolicy
 from mushroom_rl.approximators.parametric import RecurrentTorchApproximator
-from mushroom_rl.utils.torch_utils import TorchUtils
+from mushroom_rl.utils.torch_utils import TorchUtils, DiagonalGaussian
 from mushroom_rl.rl_utils.parameters import Parameter
 
 
@@ -75,8 +75,8 @@ class RecurrentGaussianTorchPolicy(StatefulTorchPolicy):
     methods together with the sequence ``lengths``.
 
     """
-    def __init__(self, network, input_shape, output_shape, std_0=1.,
-                 log_std_min=-20, log_std_max=2, device=None, **params):
+    def __init__(self, network, input_shape, output_shape, std_0=1., log_std_min=-20, log_std_max=2, device=None,
+                 validate_args=False, **params):
         """
         Constructor.
 
@@ -90,6 +90,8 @@ class RecurrentGaussianTorchPolicy(StatefulTorchPolicy):
             log_std_min ([float, Parameter], -20): min value for the policy log std;
             log_std_max ([float, Parameter], 2): max value for the policy log std;
             device (str, None): device the policy is stored on, or ``None`` for the default one;
+            validate_args (bool, False): whether the distributions of the policy validate their parameters and the
+                values passed to ``log_prob``;
             **params: parameters used by the network constructor.
 
         """
@@ -98,7 +100,7 @@ class RecurrentGaussianTorchPolicy(StatefulTorchPolicy):
         self._mu = RecurrentTorchApproximator(input_shape=input_shape, output_shape=output_shape,
                                               network=network, device=device, **params)
 
-        super().__init__(self._mu.policy_state_shape, device=device)
+        super().__init__(self._mu.policy_state_shape, device=device, validate_args=validate_args)
 
         self._predict_params = dict()
 
@@ -126,31 +128,45 @@ class RecurrentGaussianTorchPolicy(StatefulTorchPolicy):
         return action, dist.log_prob(action), next_policy_state
 
     def log_prob(self, state, action, policy_state, lengths=None, **kwargs):
-        return self.distribution(state, policy_state, lengths, **kwargs).log_prob(action)
+        dist = self.distribution(state, policy_state, lengths, **kwargs)
+        assert action.shape == dist.batch_shape + dist.event_shape
+
+        return dist.log_prob(action)
 
     def entropy(self, state=None, action_history=None):
-        return self._action_dim / 2 * torch.log(torch.tensor(2 * torch.pi * torch.e)) + torch.sum(self._log_sigma)
+        log_sigma = torch.clamp(self._log_sigma, self._log_std_min.get_value(), self._log_std_max.get_value())
+        return self._action_dim / 2 * torch.log(torch.tensor(2 * torch.pi * torch.e)) + torch.sum(log_sigma)
 
     def distribution(self, state, policy_state, lengths=None, **kwargs):
-        mu, sigma, _ = self.get_mean_and_covariance_and_policy_state(state, policy_state, lengths, **kwargs)
-        return torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=sigma)
+        dist, _ = self.distribution_and_policy_state(state, policy_state, lengths, **kwargs)
+        return dist
+
+    def mean(self, state, policy_state, lengths=None, **kwargs):
+        """
+        Compute the mean action in the given states, differentiable with respect to the policy parameters.
+
+        Args:
+            state (torch.Tensor): the set of states where the mean is computed;
+            policy_state (torch.Tensor): the policy internal states;
+            lengths (torch.Tensor, None): the length of each input sequence, defaulted to ones when None;
+            **kwargs: additional per-timestep conditioning inputs.
+
+        Returns:
+            The mean action for the provided states.
+
+        """
+        mu, _ = self._mean_and_policy_state(state, policy_state, lengths, **kwargs)
+        return mu
 
     def distribution_and_policy_state(self, state, policy_state, lengths=None, **kwargs):
-        mu, sigma, policy_state = self.get_mean_and_covariance_and_policy_state(state, policy_state, lengths, **kwargs)
-        return torch.distributions.MultivariateNormal(loc=mu, covariance_matrix=sigma), policy_state
-
-    def get_mean_and_covariance_and_policy_state(self, state, policy_state, lengths=None, **kwargs):
-        mu, next_hidden_state = self._mu(state, policy_state, lengths=lengths, **kwargs, **self._predict_params)
+        mu, next_policy_state = self._mean_and_policy_state(state, policy_state, lengths, **kwargs)
 
         log_sigma = torch.clamp(self._log_sigma, self._log_std_min(), self._log_std_max())
 
-        covariance = torch.diag(torch.exp(2 * log_sigma))
-        return mu, covariance, next_hidden_state
+        return DiagonalGaussian(mu, torch.exp(log_sigma), validate_args=self._validate_args), next_policy_state
 
     def set_weights(self, weights):
-        log_sigma_data = TorchUtils.to_float_tensor(weights[-self._action_dim:], self._device)
-        self._log_sigma.data = log_sigma_data
-
+        TorchUtils.set_weights([self._log_sigma], weights[-self._action_dim:])
         self._mu.set_weights(weights[:-self._action_dim])
 
     def get_weights(self):
@@ -178,14 +194,16 @@ class RecurrentGaussianTorchPolicy(StatefulTorchPolicy):
         with torch.no_grad():
             dist, next_policy_state = self.distribution_and_policy_state(state, policy_state,
                                                                          action_history=action_history)
-            action = dist.sample()
+            action = dist.rsample()
 
             return action, next_policy_state
 
     def _draw_action_greedy(self, state, policy_state, action_history=None):
         with torch.no_grad():
-            dist, next_policy_state = self.distribution_and_policy_state(state, policy_state,
-                                                                         action_history=action_history)
-            action = dist.mean
+            return self._mean_and_policy_state(state, policy_state, action_history=action_history)
 
-            return action, next_policy_state
+    def _mean_and_policy_state(self, state, policy_state, lengths=None, **kwargs):
+        mu, next_policy_state = self._mu(state, policy_state, lengths=lengths, **kwargs, **self._predict_params)
+        assert mu.shape[-1] == self._action_dim
+
+        return mu, next_policy_state

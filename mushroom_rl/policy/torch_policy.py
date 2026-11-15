@@ -3,9 +3,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from mushroom_rl.policy import Policy
+from mushroom_rl.policy import Policy, HasLocation
 from mushroom_rl.approximators.parametric import TorchApproximator
-from mushroom_rl.utils.torch_utils import TorchUtils, CategoricalWrapper, SquashedGaussian
+from mushroom_rl.utils.torch_utils import TorchUtils, CategoricalWrapper, SquashedGaussian, DiagonalGaussian
 from mushroom_rl.rl_utils.parameters import Parameter
 
 from itertools import chain
@@ -19,16 +19,22 @@ class TorchPolicy(Policy):
 
     """
 
-    def __init__(self, device=None, **kwargs):
+    def __init__(self, device=None, validate_args=False, **kwargs):
         """
         Constructor.
 
         Args:
             device (str, None): device the policy is stored on, or ``None`` for the default one;
+            validate_args (bool, False): whether the distributions of the policy validate their parameters and the
+                values passed to ``log_prob``;
             **kwargs: the remaining keyword arguments, passed to the constructor of the base policy.
 
         """
         super().__init__(backend='torch', device=device, **kwargs)
+
+        self._validate_args = validate_args
+
+        self._add_save_attr(_validate_args='primitive')
 
     def __call__(self, state, action):
         return torch.exp(self.log_prob(state, action))
@@ -128,13 +134,13 @@ class TorchPolicy(Policy):
         raise NotImplementedError
 
 
-class GaussianTorchPolicy(TorchPolicy):
+class GaussianTorchPolicy(HasLocation, TorchPolicy):
     """
     Torch policy implementing a Gaussian policy with trainable standard deviation. The standard deviation is not
     state-dependent.
 
     """
-    def __init__(self, network, input_shape, output_shape, std_0=1., device=None, **params):
+    def __init__(self, network, input_shape, output_shape, std_0=1., device=None, validate_args=False, **params):
         """
         Constructor.
 
@@ -144,10 +150,12 @@ class GaussianTorchPolicy(TorchPolicy):
             output_shape (tuple): the shape of the action space;
             std_0 (float, 1.): initial standard deviation;
             device (str, None): device the policy is stored on, or ``None`` for the default one;
+            validate_args (bool, False): whether the distributions of the policy validate their parameters and the
+                values passed to ``log_prob``;
             **params: parameters used by the network constructor.
 
         """
-        super().__init__(device)
+        super().__init__(device, validate_args=validate_args)
 
         self._action_dim = output_shape[0]
 
@@ -169,11 +177,30 @@ class GaussianTorchPolicy(TorchPolicy):
 
     def draw_action(self, state, action_history=None):
         with torch.no_grad():
-            return self.distribution(state, action_history=action_history).sample()
+            return self.distribution(state, action_history=action_history).rsample()
 
     def draw_action_greedy(self, state, action_history=None):
         with torch.no_grad():
-            return self.distribution(state, action_history=action_history).mean
+            return self.location(state, action_history)
+
+    def location(self, state, action_history=None):
+        """
+        Compute the location of the action distribution in ``state``, i.e. the mean of the Gaussian, differentiable
+        with respect to the policy parameters.
+
+        Args:
+            state (torch.Tensor): the set of states where the action is computed;
+            action_history (torch.Tensor, None): the previous actions, or ``None`` when no previous-action input is
+                used.
+
+        Returns:
+            The location of the action distribution.
+
+        """
+        mu = self._mu(state, action_history=action_history, **self._predict_params)
+        assert mu.shape[-1] == self._action_dim
+
+        return mu
 
     def draw_with_log_prob(self, state, action_history=None):
         dist = self.distribution(state, action_history=action_history)
@@ -182,34 +209,82 @@ class GaussianTorchPolicy(TorchPolicy):
         return a, dist.log_prob(a)
 
     def log_prob(self, state, action, action_history=None):
-        return self.distribution(state, action_history=action_history).log_prob(action)
+        dist = self.distribution(state, action_history=action_history)
+        assert action.shape == dist.batch_shape + dist.event_shape
+
+        return dist.log_prob(action)
 
     def entropy(self, state=None, action_history=None):
         return self._action_dim / 2 * torch.log(TorchUtils.to_float_tensor(2 * np.pi * np.e, self._device))\
                + torch.sum(self._log_sigma)
 
     def distribution(self, state, action_history=None):
-        mu, chol_sigma = self.get_mean_and_chol(state, action_history=action_history)
-        return torch.distributions.MultivariateNormal(loc=mu, scale_tril=chol_sigma, validate_args=False)
-
-    def get_mean_and_chol(self, state, action_history=None):
-        mean = self._mu(state, action_history=action_history, **self._predict_params)
-        return mean, torch.diag(torch.exp(self._log_sigma))
+        return DiagonalGaussian(self.location(state, action_history), torch.exp(self._log_sigma),
+                                validate_args=self._validate_args)
 
     def set_weights(self, weights):
-        log_sigma_data = TorchUtils.to_float_tensor(weights[-self._action_dim:], self._device)
-        self._log_sigma.data = log_sigma_data
+        own_parameters = list(self._own_parameters())
+        n_mu_weights = len(weights) - sum(p.numel() for p in own_parameters)
 
-        self._mu.set_weights(weights[:-self._action_dim])
+        TorchUtils.set_weights(own_parameters, weights[n_mu_weights:])
+        self._mu.set_weights(weights[:n_mu_weights])
 
     def get_weights(self):
-        mu_weights = self._mu.get_weights()
-        sigma_weights = self._log_sigma.data.detach()
-
-        return torch.concatenate([mu_weights, sigma_weights])
+        return torch.concatenate([self._mu.get_weights(), TorchUtils.get_weights(self._own_parameters())])
 
     def parameters(self):
-        return chain(self._mu.parameters(), [self._log_sigma])
+        return chain(self._mu.parameters(), self._own_parameters())
+
+    def _own_parameters(self):
+        return [self._log_sigma]
+
+
+class CholeskyGaussianTorchPolicy(GaussianTorchPolicy):
+    """
+    Torch policy implementing a Gaussian policy with trainable full covariance, parameterized by its Cholesky factor.
+    The covariance is not state-dependent. The weights are the mean network weights, the logarithm of the diagonal
+    of the Cholesky factor and its strictly lower triangular entries, in row-major order.
+
+    """
+    def __init__(self, network, input_shape, output_shape, std_0=1., device=None, validate_args=False, **params):
+        """
+        Constructor.
+
+        Args:
+            network (object): the network class used to implement the mean approximator;
+            input_shape (tuple): the shape of the state space;
+            output_shape (tuple): the shape of the action space;
+            std_0 (float, 1.): initial standard deviation of every action component, with zero initial correlation;
+            device (str, None): device the policy is stored on, or ``None`` for the default one;
+            validate_args (bool, False): whether the distributions of the policy validate their parameters and the
+                values passed to ``log_prob``;
+            **params: parameters used by the network constructor.
+
+        """
+        super().__init__(network, input_shape, output_shape, std_0=std_0, device=device, validate_args=validate_args,
+                         **params)
+
+        n_off_diagonal = self._action_dim * (self._action_dim - 1) // 2
+        self._chol_off_diagonal = nn.Parameter(torch.zeros(n_off_diagonal, device=self._device))
+        self._tril_indices = torch.tril_indices(self._action_dim, self._action_dim, -1, device=self._device)
+
+        self._add_save_attr(_chol_off_diagonal='torch', _tril_indices='none')
+
+    def distribution(self, state, action_history=None):
+        return torch.distributions.MultivariateNormal(loc=self.location(state, action_history),
+                                                      scale_tril=self._chol_sigma(), validate_args=self._validate_args)
+
+    def _own_parameters(self):
+        return super()._own_parameters() + [self._chol_off_diagonal]
+
+    def _chol_sigma(self):
+        chol_sigma = torch.diag(torch.exp(self._log_sigma))
+        chol_sigma[self._tril_indices[0], self._tril_indices[1]] = self._chol_off_diagonal
+
+        return chol_sigma
+
+    def _post_load(self, device):
+        self._tril_indices = torch.tril_indices(self._action_dim, self._action_dim, -1, device=self._device)
 
 
 class BoltzmannTorchPolicy(TorchPolicy):
@@ -217,7 +292,7 @@ class BoltzmannTorchPolicy(TorchPolicy):
     Torch policy implementing a Boltzmann policy.
 
     """
-    def __init__(self, network, input_shape, output_shape, beta, device=None, **params):
+    def __init__(self, network, input_shape, output_shape, beta, device=None, validate_args=False, **params):
         """
         Constructor.
 
@@ -229,10 +304,12 @@ class BoltzmannTorchPolicy(TorchPolicy):
                 infinity, the policy becomes more and more random. As the temperature approaches 0.0, the policy becomes
                 more and more greedy;
             device (str, None): device the policy is stored on, or ``None`` for the default one;
+            validate_args (bool, False): whether the distributions of the policy validate their parameters and the
+                values passed to ``log_prob``;
             **params: parameters used by the network constructor.
 
         """
-        super().__init__(device)
+        super().__init__(device, validate_args=validate_args)
 
         self._action_dim = output_shape[0]
         self._predict_params = dict()
@@ -252,11 +329,11 @@ class BoltzmannTorchPolicy(TorchPolicy):
         with torch.no_grad():
             self._beta.update(state)
 
-            return self.distribution(state, action_history=action_history).sample().unsqueeze(-1)
+            return self.distribution(state, action_history=action_history).sample()
 
     def draw_action_greedy(self, state, action_history=None):
         with torch.no_grad():
-            return self.distribution(state, action_history=action_history).mode.unsqueeze(-1)
+            return self.distribution(state, action_history=action_history).mode
 
     def draw_with_log_prob(self, state, action_history=None):
         raise NotImplementedError("The Boltzmann policy cannot be sampled with the reparametrization trick.")
@@ -270,7 +347,7 @@ class BoltzmannTorchPolicy(TorchPolicy):
     def distribution(self, state, action_history=None):
         history_kwargs = dict() if action_history is None else dict(action_history=action_history)
         logits = self._logits(state, **history_kwargs, **self._predict_params) * self._beta.get_value(state)
-        return CategoricalWrapper(logits)
+        return CategoricalWrapper(logits, validate_args=self._validate_args)
 
     def set_weights(self, weights):
         self._logits.set_weights(weights)
@@ -285,14 +362,15 @@ class BoltzmannTorchPolicy(TorchPolicy):
         self._beta = Parameter.make(beta, backend='torch', device=self._device)
 
 
-class SquashedGaussianTorchPolicy(TorchPolicy):
+class SquashedGaussianTorchPolicy(HasLocation, TorchPolicy):
     """
     Torch policy implementing a Gaussian policy squashed by a tanh and remapped to a bounded action range, as used
     by the Soft Actor-Critic algorithm. The squashing and the corresponding change-of-variables are handled by the
     :class:`~mushroom_rl.utils.torch_utils.torch_distributions.SquashedGaussian` distribution.
 
     """
-    def __init__(self, mu_approximator, sigma_approximator, min_a, max_a, log_std_min, log_std_max, device=None):
+    def __init__(self, mu_approximator, sigma_approximator, min_a, max_a, log_std_min, log_std_max, device=None,
+                 validate_args=False):
         """
         Constructor.
 
@@ -303,10 +381,12 @@ class SquashedGaussianTorchPolicy(TorchPolicy):
             max_a (np.ndarray): a vector specifying the maximum action value for each component;
             log_std_min ([float, Parameter]): min value for the policy log std;
             log_std_max ([float, Parameter]): max value for the policy log std;
-            device (str, None): device the policy is stored on, or ``None`` for the default one.
+            device (str, None): device the policy is stored on, or ``None`` for the default one;
+            validate_args (bool, False): whether the distributions of the policy validate their parameters and the
+                values passed to ``log_prob``.
 
         """
-        super().__init__(device)
+        super().__init__(device, validate_args=validate_args)
 
         self._mu_approximator = mu_approximator
         self._sigma_approximator = sigma_approximator
@@ -331,11 +411,29 @@ class SquashedGaussianTorchPolicy(TorchPolicy):
 
     def draw_action(self, state, action_history=None):
         with torch.no_grad():
-            return self.distribution(state, action_history=action_history).sample()
+            return self.distribution(state, action_history=action_history).rsample()
 
     def draw_action_greedy(self, state, action_history=None):
         with torch.no_grad():
-            return self.distribution(state, action_history=action_history).median
+            return self.location(state, action_history)
+
+    def location(self, state, action_history=None):
+        """
+        Compute the location of the action distribution in ``state``, i.e. the mean of the underlying Gaussian
+        squashed into the action range, differentiable with respect to the policy parameters.
+
+        Args:
+            state (torch.Tensor): the set of states where the action is computed;
+            action_history (torch.Tensor, None): the previous actions, or ``None`` when no previous-action input is
+                used.
+
+        Returns:
+            The location of the action distribution.
+
+        """
+        history_kwargs = dict() if action_history is None else dict(action_history=action_history)
+        mu = self._mu_approximator.predict(state, **history_kwargs)
+        return torch.tanh(mu) * (.5 * (self._max_a - self._min_a)) + .5 * (self._max_a + self._min_a)
 
     def draw_with_log_prob(self, state, action_history=None):
         return self.distribution(state, action_history=action_history).rsample_and_log_prob()
@@ -352,7 +450,8 @@ class SquashedGaussianTorchPolicy(TorchPolicy):
         mu = self._mu_approximator.predict(state, **history_kwargs)
         log_sigma = self._sigma_approximator.predict(state, **history_kwargs)
         log_sigma = torch.clamp(log_sigma, self._log_std_min(), self._log_std_max())
-        return SquashedGaussian(mu, log_sigma.exp(), self._min_a, self._max_a, eps=self._eps)
+        return SquashedGaussian(mu, log_sigma.exp(), self._min_a, self._max_a, eps=self._eps,
+                                validate_args=self._validate_args)
 
     def set_weights(self, weights):
         mu_weights = weights[:self._mu_approximator.weights_size]

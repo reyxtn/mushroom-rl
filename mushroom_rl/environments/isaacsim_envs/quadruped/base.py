@@ -24,12 +24,10 @@ class QuadrupedIsaac(IsaacSim):
 
     """
     def __init__(self, usd_path, action_spec, default_joint_angles, trunk_body, foot_bodies, sub_bodies,
-                 observation_spec, additional_data_spec, collision_groups, num_envs, horizon,
-                 domain_randomization, camera_position, camera_target,
-                 default_joint_max_vel=None,
-                 nominal_p_gain=20., nominal_d_gain=0.5, nominal_scaling_factor=0.25, reward_weights=None,
-                 randomization_params=None, observed_randomization=(), command_generator=None,
-                 reward_params=None, tracking_stds=None, gpu_params=None):
+                 observation_spec, additional_data_spec, collision_groups, num_envs, horizon, domain_randomization,
+                 camera_position, camera_target, default_joint_max_vel=None, nominal_p_gain=20., nominal_d_gain=0.5,
+                 nominal_scaling_factor=0.25, reward_weights=None, randomization_params=None, observed_randomization=(),
+                 command_generator=None, reward_params=None, tracking_stds=None, gpu_params=None):
         """
         Constructor.
 
@@ -39,7 +37,7 @@ class QuadrupedIsaac(IsaacSim):
             default_joint_angles (torch.tensor): The nominal joint configuration the actions are expressed
                 relative to.
             trunk_body (str): The name of the trunk body, whose inertial properties are randomized.
-            foot_bodies (list): The prim paths of the feet.
+            foot_bodies (list): The names of the feet.
             sub_bodies (list): The names of every body of the robot, the trunk first.
             observation_spec (list): The observation specification, forwarded to :class:`IsaacSim`.
             additional_data_spec (list): The additional data specification, forwarded to :class:`IsaacSim`.
@@ -977,13 +975,8 @@ class QuadrupedIsaac(IsaacSim):
                                               torch.zeros_like(self._foot_contact_time))
         self._foot_contact = contact
 
-        n_feet = len(self._foot_bodies)
-        self._foot_positions = torch.stack(
-            [self._observation_helper.read_data(f"foot_pos_{i}") for i in range(n_feet)], dim=1
-        )
-        self._foot_velocities = torch.stack(
-            [self._observation_helper.read_data(f"foot_lin_vel_{i}") for i in range(n_feet)], dim=1
-        )
+        self._foot_positions = self._observation_helper.read_data("foot_pos")
+        self._foot_velocities = self._observation_helper.read_data("foot_lin_vel")
 
     def _foot_clearance_value(self, target, std):
         """
@@ -992,7 +985,7 @@ class QuadrupedIsaac(IsaacSim):
             the feet.
 
         """
-        height = self._foot_positions[:, :, 2] - self._env_pos[:, 2].unsqueeze(1)
+        height = self._foot_positions[:, :, 2]
         airborne = torch.logical_not(self._foot_contact)
         return torch.sum(torch.exp(-torch.square(height - target) / std**2) * airborne, dim=1)
 
@@ -1046,11 +1039,9 @@ class QuadrupedIsaac(IsaacSim):
     @staticmethod
     def _get_foot_state_data_spec(foot_bodies):
         """
-        Builds the additional data specification the optional foot reward terms read the world pose and
+        Builds the additional data specification the optional foot reward terms read the position and linear
         velocity of every foot from.
 
         """
-        return [entry
-                for i, path in enumerate(foot_bodies)
-                for entry in ((f"foot_pos_{i}", path, ObservationType.BODY_POS, None),
-                              (f"foot_lin_vel_{i}", path, ObservationType.BODY_LIN_VEL, None))]
+        return [("foot_pos", "", ObservationType.SUB_BODY_POS, foot_bodies),
+                ("foot_lin_vel", "", ObservationType.SUB_BODY_LIN_VEL, foot_bodies)]

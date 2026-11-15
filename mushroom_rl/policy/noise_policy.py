@@ -1,11 +1,11 @@
 import torch
 import numpy as np
 
-from mushroom_rl.policy.policy import Policy, StatefulPolicy, HasWeights
+from mushroom_rl.policy.policy import Policy, StatefulPolicy, HasWeights, HasLocation
 from mushroom_rl.rl_utils.parameters import CovarianceParameter
 
 
-class OrnsteinUhlenbeckPolicy(HasWeights, StatefulPolicy):
+class OrnsteinUhlenbeckPolicy(HasWeights, HasLocation, StatefulPolicy):
     """
     Exploration policy adding temporally correlated noise drawn from an Ornstein-Uhlenbeck process.
 
@@ -59,15 +59,35 @@ class OrnsteinUhlenbeckPolicy(HasWeights, StatefulPolicy):
 
     def _draw_action_greedy(self, state, policy_state):
         with torch.no_grad():
-            mu = self._approximator.predict(state, **self._predict_params)
+            return self.location(state), policy_state
 
-            return mu, policy_state
+    def location(self, state):
+        """
+        Compute the location of the action distribution in ``state``, i.e. the action without the exploration noise,
+        differentiable with respect to the policy parameters.
+
+        Args:
+            state (torch.Tensor): the state where the agent is.
+
+        Returns:
+            The location of the action distribution.
+
+        """
+        return self._approximator(state, **self._predict_params)
 
     def set_weights(self, weights):
         self._approximator.set_weights(weights)
 
     def get_weights(self):
         return self._approximator.get_weights()
+
+    def parameters(self):
+        """
+        Returns:
+            The trainable parameters of the mean approximator.
+
+        """
+        return self._approximator.parameters()
 
     @property
     def weights_size(self):
@@ -88,7 +108,7 @@ class OrnsteinUhlenbeckPolicy(HasWeights, StatefulPolicy):
         return self._policy_state
 
 
-class ClippedGaussianPolicy(HasWeights, Policy):
+class ClippedGaussianPolicy(HasWeights, HasLocation, Policy):
     """
     Gaussian policy whose sampled action is clipped to a given action range.
 
@@ -104,7 +124,7 @@ class ClippedGaussianPolicy(HasWeights, Policy):
     Thus, the non-differentiability.
 
     """
-    def __init__(self, mu, sigma, low, high, device=None):
+    def __init__(self, mu, sigma, low, high, device=None, validate_args=False):
         """
         Constructor.
 
@@ -116,7 +136,8 @@ class ClippedGaussianPolicy(HasWeights, Policy):
                 action dimensionality;
             low (torch.tensor): a vector containing the minimum action for each component;
             high (torch.tensor): a vector containing the maximum action for each component;
-            device (str, None): device the policy is stored on, or ``None`` for the default one.
+            device (str, None): device the policy is stored on, or ``None`` for the default one;
+            validate_args (bool, False): whether the distribution of the policy validates its parameters.
 
         """
         super().__init__('torch', device)
@@ -126,13 +147,15 @@ class ClippedGaussianPolicy(HasWeights, Policy):
         self._sigma = CovarianceParameter.make(sigma, backend='torch', device=self._device)
         self._low = torch.as_tensor(low, device=self._device)
         self._high = torch.as_tensor(high, device=self._device)
+        self._validate_args = validate_args
 
         self._add_save_attr(
             _approximator='mushroom',
             _predict_params='pickle',
             _sigma='mushroom',
             _low='torch',
-            _high='torch'
+            _high='torch',
+            _validate_args='primitive'
         )
         self._add_logger_attr(_sigma='sigma', group='policy')
 
@@ -146,7 +169,7 @@ class ClippedGaussianPolicy(HasWeights, Policy):
             mu = self._approximator.predict(state, **self._predict_params).reshape(-1)
 
             distribution = torch.distributions.MultivariateNormal(loc=mu, scale_tril=self._sigma.get_cholesky(),
-                                                                  validate_args=False)
+                                                                  validate_args=self._validate_args)
 
             action_raw = distribution.sample()
 
@@ -154,15 +177,35 @@ class ClippedGaussianPolicy(HasWeights, Policy):
 
     def draw_action_greedy(self, state):
         with torch.no_grad():
-            mu = self._approximator.predict(state, **self._predict_params).reshape(-1)
+            return torch.clip(self.location(state).reshape(-1), self._low, self._high)
 
-            return torch.clip(mu, self._low, self._high)
+    def location(self, state):
+        """
+        Compute the location of the action distribution in ``state``, i.e. the mean of the Gaussian before
+        clipping, differentiable with respect to the policy parameters.
+
+        Args:
+            state (torch.Tensor): the state where the agent is.
+
+        Returns:
+            The location of the action distribution.
+
+        """
+        return self._approximator(state, **self._predict_params)
 
     def set_weights(self, weights):
         self._approximator.set_weights(weights)
 
     def get_weights(self):
         return self._approximator.get_weights()
+
+    def parameters(self):
+        """
+        Returns:
+            The trainable parameters of the mean approximator.
+
+        """
+        return self._approximator.parameters()
 
     @property
     def weights_size(self):

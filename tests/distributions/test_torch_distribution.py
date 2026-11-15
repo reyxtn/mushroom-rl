@@ -45,6 +45,10 @@ def test_diagonal():
     dist.set_parameters(rho)
     assert torch.allclose(dist.get_parameters().detach(), rho)
 
+    expected = rho.clone()
+    rho += 1.
+    assert torch.equal(dist.get_parameters().detach(), expected)
+
 
 def test_cholesky():
     torch.manual_seed(0)
@@ -87,6 +91,24 @@ def test_cholesky():
     dist.set_parameters(rho)
     assert torch.allclose(dist.get_parameters().detach(), rho)
 
+    expected = rho.clone()
+    rho += 1.
+    assert torch.equal(dist.get_parameters().detach(), expected)
+
+
+def test_init_copy():
+    for cls, sigma in [(DiagonalGaussianTorchDistribution, torch.ones(2)),
+                       (CholeskyGaussianTorchDistribution, torch.eye(2))]:
+        mu = torch.tensor([1., 2.])
+        dist = cls(mu, sigma)
+        mu += 1.
+
+        assert torch.equal(dist.mean(), torch.tensor([1., 2.]))
+
+        dist.set_parameters(dist.get_parameters().double())
+
+        assert all(p.dtype == torch.float32 for p in dist.parameters())
+
 
 def test_mean_copy():
     mu = torch.tensor([1., 2.])
@@ -114,3 +136,16 @@ def test_abstract():
     for call in calls:
         with pytest.raises(NotImplementedError):
             call()
+
+
+def test_validate_args():
+    mu = torch.tensor([float('nan'), 0.])
+    theta = torch.zeros(2)
+
+    assert torch.isnan(DiagonalGaussianTorchDistribution(mu, torch.ones(2)).log_pdf(theta))
+    assert torch.isnan(CholeskyGaussianTorchDistribution(mu, torch.eye(2)).log_pdf(theta))
+
+    with pytest.raises(ValueError):
+        DiagonalGaussianTorchDistribution(mu, torch.ones(2), validate_args=True).log_pdf(theta)
+    with pytest.raises(ValueError):
+        CholeskyGaussianTorchDistribution(mu, torch.eye(2), validate_args=True).log_pdf(theta)

@@ -378,7 +378,7 @@ def parse_args():
     g = p.add_argument_group("algorithm")
     g.add_argument("--alg", choices=("rudin", "ppo"), default="rudin",
                    help="RudinPPO (adaptive learning rate from the policy KL, gradient clipping), or plain PPO")
-    g.add_argument("--history-length", type=int, default=1, help="stacked observations the networks read")
+    g.add_argument("--history-length", type=int, default=8, help="stacked observations the networks read")
     g.add_argument("--n-envs", type=int, default=4096)
     g.add_argument("--fragment-length", type=int, default=24, help="on-policy steps per environment per fit")
     g.add_argument("--fits-per-epoch", type=int, default=10)

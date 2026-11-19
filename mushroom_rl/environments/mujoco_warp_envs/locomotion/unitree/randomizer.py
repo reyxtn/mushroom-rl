@@ -105,7 +105,8 @@ class Randomizer:
             (long tensor, actuator indices the policy controls);
         default_joint_pos (torch.Tensor): nominal angle of every actuator's
             joint, (nu,);
-        action_scale (float): nominal action scaling;
+        action_scale (float, torch.Tensor): nominal action scaling, one value
+            or one per controlled joint;
         step_dt (float): duration of one intermediate step, in seconds. Used
             to convert ``max_delay`` into steps;
         params (RandomizationParams, None): the ranges.
@@ -162,7 +163,7 @@ class Randomizer:
             frictionloss=v["dof_frictionloss"][0, self._dofs].clone(),
             stiffness=v["jnt_stiffness"][0, self._jnts].clone(),
             joint_nominal_pos=default_joint_pos.to(dev).clone(),
-            action_scale=float(action_scale),
+            action_scale=torch.as_tensor(action_scale, dtype=torch.float32, device=dev),
             total_mass=v["body_mass"][0].sum().clone(),
         )
         if not torch.allclose(
@@ -179,9 +180,7 @@ class Randomizer:
             p_gain=self._default["kp"].expand(n_envs, nu).clone(),
             d_gain=self._default["kd"].expand(n_envs, nu).clone(),
             torque_limit=self._default["forcerange"][:, 1].expand(n_envs, nu).clone(),
-            action_scaling_factor=torch.full(
-                (n_envs, nc), self._default["action_scale"], device=dev
-            ),
+            action_scaling_factor=self._default["action_scale"].expand(n_envs, nc).clone(),
             joint_nominal_position=self._default["joint_nominal_pos"]
             .expand(n_envs, nu)
             .clone(),
